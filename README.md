@@ -1,8 +1,9 @@
 # Scout robot simulator
 
-An English voice-and-vision robot simulator. Scout listens until three seconds
-of silence, sends the transcript and a current webcam frame to Groq Qwen, and
-simulates validated `move` and `turn` calls in the terminal.
+An English voice-and-vision robot simulator. When speech begins, Scout sends a
+fresh webcam frame to Groq Qwen for a compact scene report while recording
+continues. After transcription, GPT-OSS-120B receives only the transcript and
+scene report, then simulates validated `move` and `turn` calls in the terminal.
 
 This version must not be connected to motors. A single webcam image cannot
 provide safe physical distance or angle estimates.
@@ -19,13 +20,13 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Put your Groq and Deepgram API keys in `.env`. Groq handles STT and the agent;
-Deepgram Aura-2 streams speech output from one request per reply. Scout listens
-while network requests and actions run.
+Put your Groq and Deepgram API keys in `.env`. Groq runs Whisper, Qwen vision,
+and the text-only GPT-OSS agent; Deepgram Aura-2 streams speech output from one
+request per reply. Scout listens while network requests and actions run.
 New speech cancels the active turn and pending motion immediately. Microphone
 processing is disabled only while Scout speaks, so its own output is ignored.
 
-The optional speech model override is `DEEPGRAM_TTS_MODEL`.
+Model overrides are `VISION_MODEL`, `LLM_MODEL`, and `DEEPGRAM_TTS_MODEL`.
 
 List devices and configure `MIC_DEVICE` / `OUTPUT_DEVICE` in `.env` if needed:
 

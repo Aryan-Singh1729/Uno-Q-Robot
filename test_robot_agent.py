@@ -103,16 +103,26 @@ class AgentLoopTests(unittest.TestCase):
         agent = GroqRobot("unused", client=client, camera=camera or FakeCamera())
         return agent, client
 
-    def test_direct_visual_conversation(self):
-        agent, client = self.make_agent([response(content="I can see a desk.")])
+    def test_qwen_describes_image_then_gpt_oss_receives_text_only(self):
+        agent, client = self.make_agent(
+            [
+                response(content="Scene: desk centered; path clear."),
+                response(content="I can see a desk."),
+            ],
+            FakeCamera(value="data:image/jpeg;base64,anBlZw=="),
+        )
         with patch("robot_agent.Path.write_bytes") as write_bytes:
-            outcome = agent.run_turn(
-                "What can you see?", "data:image/jpeg;base64,anBlZw==", lambda _: None
-            )
+            scene = agent.describe_scene()
+        outcome = agent.run_turn("What can you see?", scene, lambda _: None)
         self.assertEqual(outcome.reply, "I can see a desk.")
         write_bytes.assert_called_once_with(b"jpeg")
-        content = client.completions.calls[0]["messages"][-1]["content"]
-        self.assertEqual(content[1]["type"], "image_url")
+        vision_call, agent_call = client.completions.calls
+        self.assertEqual(vision_call["model"], "qwen/qwen3.6-27b")
+        self.assertEqual(vision_call["messages"][-1]["content"][1]["type"], "image_url")
+        self.assertEqual(agent_call["model"], "openai/gpt-oss-120b")
+        self.assertIsInstance(agent_call["messages"][-1]["content"], str)
+        self.assertIn(scene, agent_call["messages"][-1]["content"])
+        self.assertEqual(agent_call["reasoning_effort"], "low")
 
     def test_deepgram_tts_uses_one_streaming_pcm_request(self):
         agent, _ = self.make_agent([])
@@ -129,6 +139,15 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("container=none", request.full_url)
         self.assertEqual(stream.read(), pcm)
 
+    def test_vision_report_is_capped_at_one_hundred_words(self):
+        agent, _ = self.make_agent(
+            [response(content=" ".join(f"word{i}" for i in range(130)))],
+            FakeCamera(value="data:image/jpeg;base64,anBlZw=="),
+        )
+        with patch("robot_agent.Path.write_bytes"):
+            report = agent.describe_scene()
+        self.assertEqual(len(report.removesuffix("…").split()), 100)
+
     def test_tool_executes_before_final_response(self):
         call = tool_call("one", "move", {"speed": 25, "distance": 40})
         agent, client = self.make_agent(
@@ -140,7 +159,7 @@ class AgentLoopTests(unittest.TestCase):
             seen.append(motion)
             return ActionResult(content=json.dumps({"status": "simulated"}))
 
-        outcome = agent.run_turn("Move a little", None, act)
+        outcome = agent.run_turn("Move a little", "Path clear.", act)
         self.assertEqual(seen, [MotionCall("move", 25, 40.0)])
         self.assertEqual(outcome.reply, "Movement simulated.")
         second_messages = client.completions.calls[1]["messages"]
@@ -156,7 +175,7 @@ class AgentLoopTests(unittest.TestCase):
             [response(tool_calls=[bad]), response(content="Please try that again.")]
         )
         outcome = agent.run_turn(
-            "Move", None, lambda _: self.fail("invalid call reached executor")
+            "Move", "Path clear.", lambda _: self.fail("invalid call reached executor")
         )
         self.assertEqual(outcome.reply, "Please try that again.")
 
@@ -168,7 +187,7 @@ class AgentLoopTests(unittest.TestCase):
         executed = []
         outcome = agent.run_turn(
             "Turn repeatedly",
-            None,
+            "Path clear.",
             lambda call: executed.append(call) or ActionResult(content="{}"),
         )
         self.assertEqual(len(executed), 4)
@@ -180,7 +199,7 @@ class AgentLoopTests(unittest.TestCase):
         agent, client = self.make_agent([response(tool_calls=[call])])
         outcome = agent.run_turn(
             "Move",
-            None,
+            "Path clear.",
             lambda _: ActionResult(interruption=b"new utterance"),
         )
         self.assertEqual(outcome.interruption, b"new utterance")
@@ -189,8 +208,8 @@ class AgentLoopTests(unittest.TestCase):
 
     def test_camera_failure_falls_back(self):
         agent, _ = self.make_agent([], FakeCamera(error=RuntimeError("no camera")))
-        self.assertIsNone(agent.capture_frame())
-        self.assertIsNone(agent.capture_frame())
+        self.assertEqual(agent.describe_scene(), "Visual context unavailable.")
+        self.assertEqual(agent.describe_scene(), "Visual context unavailable.")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ import os
 import queue
 import sys
 import threading
+from concurrent.futures import Future
 from dataclasses import dataclass
 from enum import Enum
 
@@ -37,7 +38,8 @@ class Settings:
     api_key: str
     deepgram_api_key: str
     robot_name: str = "Scout"
-    llm_model: str = "qwen/qwen3.6-27b"
+    llm_model: str = "openai/gpt-oss-120b"
+    vision_model: str = "qwen/qwen3.6-27b"
     stt_model: str = "whisper-large-v3-turbo"
     tts_model: str = "aura-2-thalia-en"
     mic_device: str | None = None
@@ -64,6 +66,7 @@ class RobotApp:
         self.speech_generation = 0
         self.capture_generation = 0
         self.turn_generation = 0
+        self.vision_futures: dict[int, Future[str]] = {}
         self.worker: threading.Thread | None = None
 
     def set_state(self, state: State) -> None:
@@ -106,13 +109,38 @@ class RobotApp:
             self.turn_queue.put((wav, self.capture_generation))
 
     def _on_speech_start(self) -> None:
+        future: Future[str] = Future()
         with self.generation_lock:
+            stale_vision = list(self.vision_futures.values())
+            self.vision_futures.clear()
             self.speech_generation += 1
             self.capture_generation = self.speech_generation
+            generation = self.speech_generation
+            self.vision_futures[generation] = future
+        for stale in stale_vision:
+            stale.cancel()
+        threading.Thread(
+            target=self._describe_scene,
+            args=(future,),
+            name=f"vision-{generation}",
+            daemon=True,
+        ).start()
         self.motion_stop.set()
         if self.worker_busy.is_set():
             print("[INTERRUPT] speech detected; cancelling the active turn and motion")
         self.set_state(State.RECORDING)
+
+    def _describe_scene(self, future: Future[str]) -> None:
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            future.set_result(self.agent.describe_scene())
+        except Exception as exc:
+            future.set_exception(exc)
+
+    def _take_vision(self, generation: int) -> Future[str] | None:
+        with self.generation_lock:
+            return self.vision_futures.pop(generation, None)
 
     def _turn_cancelled(self) -> bool:
         with self.generation_lock:
@@ -126,34 +154,52 @@ class RobotApp:
             wav, generation = item
             with self.generation_lock:
                 if generation < self.speech_generation:
+                    future = self.vision_futures.pop(generation, None)
+                    if future is not None:
+                        future.cancel()
                     print("[PROCESSING] discarded superseded utterance")
                     continue
                 self.turn_generation = generation
                 self.motion_stop.clear()
             self.worker_busy.set()
             try:
-                self._process_turn(wav)
+                self._process_turn(wav, generation)
             finally:
                 self.worker_busy.clear()
 
-    def _process_turn(self, wav: bytes) -> None:
+    def _process_turn(self, wav: bytes, generation: int) -> None:
         self.set_state(State.PROCESSING)
-        frame = self.agent.capture_frame()
+        vision = self._take_vision(generation)
         try:
             transcript = self.agent.transcribe(wav)
         except Exception as exc:
+            if vision is not None:
+                vision.cancel()
             print(f"[STT] failed; listening again: {exc}")
             return
         if self._turn_cancelled():
             print("[PROCESSING] turn superseded by new speech")
             return
         if not transcript:
+            if vision is not None:
+                vision.cancel()
             print("[STT] no speech recognized")
             return
         print(f"You: {transcript}")
 
         try:
-            outcome = self.agent.run_turn(transcript, frame, self._handle_action)
+            scene_description = (
+                vision.result() if vision is not None else "Visual context unavailable."
+            )
+        except Exception as exc:
+            print(f"[VISION] analysis failed; continuing text-only: {exc}")
+            scene_description = "Visual context unavailable."
+        if self._turn_cancelled():
+            print("[PROCESSING] turn superseded by new speech")
+            return
+
+        try:
+            outcome = self.agent.run_turn(transcript, scene_description, self._handle_action)
         except Exception as exc:
             print(f"[LLM] request failed: {exc}")
             if not self._turn_cancelled():
@@ -339,6 +385,10 @@ class RobotApp:
         self.turn_queue.put(None)
         if self.worker is not None:
             self.worker.join(timeout=2)
+        with self.generation_lock:
+            for future in self.vision_futures.values():
+                future.cancel()
+            self.vision_futures.clear()
         self.agent.close()
 
 
@@ -362,7 +412,8 @@ def load_settings() -> Settings:
         api_key=api_key,
         deepgram_api_key=deepgram_api_key,
         robot_name=os.getenv("ROBOT_NAME", "Scout"),
-        llm_model=os.getenv("LLM_MODEL", "qwen/qwen3.6-27b"),
+        llm_model=os.getenv("LLM_MODEL", "openai/gpt-oss-120b"),
+        vision_model=os.getenv("VISION_MODEL", "qwen/qwen3.6-27b"),
         stt_model=os.getenv("STT_MODEL", "whisper-large-v3-turbo"),
         tts_model=os.getenv("DEEPGRAM_TTS_MODEL", "aura-2-thalia-en"),
         mic_device=os.getenv("MIC_DEVICE"),
@@ -393,6 +444,7 @@ def main() -> int:
             settings.api_key,
             robot_name=settings.robot_name,
             llm_model=settings.llm_model,
+            vision_model=settings.vision_model,
             stt_model=settings.stt_model,
             deepgram_api_key=settings.deepgram_api_key,
             tts_model=settings.tts_model,

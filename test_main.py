@@ -1,9 +1,11 @@
 import io
+import threading
 import unittest
+from concurrent.futures import Future
 from contextlib import redirect_stdout
 
 from main import RobotApp, State
-from robot_agent import MotionCall
+from robot_agent import MotionCall, TurnOutcome
 
 
 class FakeAgent:
@@ -12,6 +14,8 @@ class FakeAgent:
     def __init__(self):
         self.synthesized = []
         self.camera_index = 0
+        self.vision_started = threading.Event()
+        self.turns = []
 
     def synthesize(self, text):
         self.synthesized.append(text)
@@ -19,6 +23,14 @@ class FakeAgent:
 
     def transcribe(self, _wav):
         return "test phrase"
+
+    def describe_scene(self):
+        self.vision_started.set()
+        return "Scene: chair ahead; path clear."
+
+    def run_turn(self, transcript, scene_description, _on_action):
+        self.turns.append((transcript, scene_description))
+        return TurnOutcome()
 
     def close(self):
         pass
@@ -67,6 +79,28 @@ class FakeAudio:
 
 
 class RobotAppActionTests(unittest.TestCase):
+    def test_speech_start_launches_vision_processing(self):
+        agent = FakeAgent()
+        app = RobotApp(agent, FakeAudio())
+        app._on_speech_start()
+        self.assertTrue(agent.vision_started.wait(timeout=1))
+        future = app._take_vision(app.capture_generation)
+        self.assertEqual(future.result(timeout=1), "Scene: chair ahead; path clear.")
+
+    def test_completed_utterance_uses_matching_vision_report(self):
+        agent = FakeAgent()
+        app = RobotApp(agent, FakeAudio())
+        vision: Future[str] = Future()
+        vision.set_result("Scene: table left; center path clear.")
+        app.speech_generation = 1
+        app.turn_generation = 1
+        app.vision_futures[1] = vision
+        app._process_turn(b"test wav", 1)
+        self.assertEqual(
+            agent.turns,
+            [("test phrase", "Scene: table left; center path clear.")],
+        )
+
     def test_action_executes_only_after_announcement_finishes(self):
         app = RobotApp(FakeAgent(), FakeAudio())
         output = io.StringIO()

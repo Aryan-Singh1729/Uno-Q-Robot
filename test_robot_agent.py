@@ -14,6 +14,7 @@ from robot_agent import (
     MotionCall,
     announcement,
     execute_motion,
+    parse_api_keys,
     validate_inspection,
     validate_motion,
 )
@@ -39,7 +40,10 @@ class FakeCompletions:
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        return self.responses.pop(0)
+        result = self.responses.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
 
 class FakeClient:
@@ -69,7 +73,16 @@ class FakeCamera:
         self.closed = True
 
 
+class FakeRateLimitError(Exception):
+    pass
+
+
 class MotionValidationTests(unittest.TestCase):
+    def test_comma_separated_api_keys(self):
+        self.assertEqual(parse_api_keys(" first, second ,, third "), ["first", "second", "third"])
+        with self.assertRaises(ValueError):
+            parse_api_keys(" , ")
+
     def test_signed_move_and_turn(self):
         move = validate_motion("move", {"speed": 30, "distance": -80})
         turn = validate_motion("turn", {"speed": 45, "angle": 90})
@@ -148,6 +161,30 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(outcome.reply, "Hello!")
         self.assertEqual(camera.calls, 0)
         self.assertEqual(len(client.completions.calls), 1)
+
+    def test_rate_limited_keys_rotate_and_wrap(self):
+        first = FakeClient([FakeRateLimitError(), response(content="Back on key one.")])
+        second = FakeClient([FakeRateLimitError()])
+        third = FakeClient([response(content="Key three works."), FakeRateLimitError()])
+        agent = GroqRobot("unused", client=first, camera=FakeCamera())
+        agent._clients = [first, second, third]
+        agent._rate_limit_error = FakeRateLimitError
+
+        self.assertEqual(agent.run_turn("First", lambda _: None).reply, "Key three works.")
+        self.assertEqual(agent._client_index, 2)
+        self.assertEqual(agent.run_turn("Second", lambda _: None).reply, "Back on key one.")
+        self.assertEqual(agent._client_index, 0)
+
+    def test_fully_rate_limited_pool_stops_after_one_cycle(self):
+        clients = [FakeClient([FakeRateLimitError()]) for _ in range(3)]
+        agent = GroqRobot("unused", client=clients[0], camera=FakeCamera())
+        agent._clients = clients
+        agent._rate_limit_error = FakeRateLimitError
+
+        with self.assertRaises(FakeRateLimitError):
+            agent.run_turn("Hello", lambda _: None)
+        self.assertEqual([len(client.completions.calls) for client in clients], [1, 1, 1])
+        self.assertEqual(agent._client_index, 0)
 
     def test_deepgram_tts_uses_one_streaming_pcm_request(self):
         agent, _ = self.make_agent([])

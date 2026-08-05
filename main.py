@@ -65,6 +65,7 @@ class RobotApp:
         self.speech_generation = 0
         self.capture_generation = 0
         self.turn_generation = 0
+        self.interrupt_generations: set[int] = set()
         self.worker: threading.Thread | None = None
 
     def set_state(self, state: State) -> None:
@@ -110,6 +111,8 @@ class RobotApp:
         with self.generation_lock:
             self.speech_generation += 1
             self.capture_generation = self.speech_generation
+            if self.worker_busy.is_set():
+                self.interrupt_generations.add(self.capture_generation)
         self.motion_stop.set()
         if self.worker_busy.is_set():
             print("[INTERRUPT] speech detected; cancelling the active turn and motion")
@@ -127,17 +130,24 @@ class RobotApp:
             wav, generation = item
             with self.generation_lock:
                 if generation < self.speech_generation:
+                    self.interrupt_generations.discard(generation)
                     print("[PROCESSING] discarded superseded utterance")
                     continue
                 self.turn_generation = generation
+                interrupted = generation in self.interrupt_generations
+                self.interrupt_generations.discard(generation)
                 self.motion_stop.clear()
             self.worker_busy.set()
             try:
-                self._process_turn(wav)
+                self._process_turn(wav, interrupted)
             finally:
                 self.worker_busy.clear()
 
-    def _process_turn(self, wav: bytes) -> None:
+    def _process_turn(self, wav: bytes, interrupted: bool = False) -> None:
+        if interrupted:
+            self._speak("Interrupt received.")
+            if self._turn_cancelled():
+                return
         self.set_state(State.PROCESSING)
         try:
             transcript = self.agent.transcribe(wav)

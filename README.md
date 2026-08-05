@@ -29,6 +29,18 @@ processing is disabled only while Scout speaks, so its own output is ignored.
 
 Model overrides are `VISION_MODEL`, `LLM_MODEL`, and `DEEPGRAM_TTS_MODEL`.
 
+`GROQ_API_KEY` accepts one key or a comma-separated circular failover pool:
+
+```dotenv
+GROQ_API_KEY=gsk_first,gsk_second,gsk_third
+```
+
+On HTTP 429, the failed request immediately moves to the next key and wraps to
+the first after the last. Each key is tried at most once per request, so a fully
+rate-limited pool fails normally instead of retrying forever. Keys from the same
+Groq organization generally share organization-level limits. Use only authorized
+project keys; do not use multiple organizations to bypass Groq's published limits.
+
 List devices and configure `MIC_DEVICE` / `OUTPUT_DEVICE` in `.env` if needed:
 
 ```bash

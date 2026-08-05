@@ -87,6 +87,17 @@ class RobotAppActionTests(unittest.TestCase):
         app._process_turn(b"test wav")
         self.assertEqual(agent.turns, [("test phrase", False)])
 
+    def test_interrupting_utterance_gets_spoken_acknowledgement(self):
+        agent = FakeAgent()
+        audio = FakeAudio()
+        app = RobotApp(agent, audio)
+        app.speech_generation = 1
+        app.turn_generation = 1
+        app._process_turn(b"test wav", interrupted=True)
+        self.assertEqual(agent.synthesized, ["Interrupt received."])
+        self.assertEqual(audio.played, [b"fake pcm"])
+        self.assertEqual(agent.turns, [("test phrase", False)])
+
     def test_action_executes_only_after_announcement_finishes(self):
         app = RobotApp(FakeAgent(), FakeAudio())
         output = io.StringIO()
@@ -117,6 +128,7 @@ class RobotAppActionTests(unittest.TestCase):
         app = RobotApp(FakeAgent(), audio)
         app.worker_busy.set()
         app._on_speech_start()
+        self.assertIn(app.capture_generation, app.interrupt_generations)
         output = io.StringIO()
         with redirect_stdout(output):
             result = app._handle_action(MotionCall("move", 30, 80))

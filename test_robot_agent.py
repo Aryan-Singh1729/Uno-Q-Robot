@@ -3,6 +3,7 @@ import json
 import math
 import threading
 import unittest
+from contextlib import redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from robot_agent import (
     MotionCall,
     announcement,
     execute_motion,
+    validate_inspection,
     validate_motion,
 )
 
@@ -51,8 +53,10 @@ class FakeCamera:
         self.value = value
         self.error = error
         self.closed = False
+        self.calls = 0
 
     def data_url(self):
+        self.calls += 1
         if self.error:
             raise self.error
         return self.value
@@ -96,6 +100,12 @@ class MotionValidationTests(unittest.TestCase):
         result = json.loads(execute_motion(MotionCall("move", 30, 80), stop))
         self.assertEqual(result["status"], "cancelled")
 
+    def test_inspection_question_validation(self):
+        self.assertEqual(validate_inspection({"question": "  Where is the chair?  "}), "Where is the chair?")
+        for arguments in ({}, {"question": ""}, {"question": 3}, {"question": "x" * 301}):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                validate_inspection(arguments)
+
 
 class AgentLoopTests(unittest.TestCase):
     def make_agent(self, responses, camera=None):
@@ -103,26 +113,41 @@ class AgentLoopTests(unittest.TestCase):
         agent = GroqRobot("unused", client=client, camera=camera or FakeCamera())
         return agent, client
 
-    def test_qwen_describes_image_then_gpt_oss_receives_text_only(self):
+    def test_gpt_oss_requests_targeted_qwen_inspection(self):
+        inspect = tool_call("vision", "inspect_scene", {"question": "Where is the desk?"})
         agent, client = self.make_agent(
             [
+                response(tool_calls=[inspect]),
                 response(content="Scene: desk centered; path clear."),
                 response(content="I can see a desk."),
             ],
             FakeCamera(value="data:image/jpeg;base64,anBlZw=="),
         )
-        with patch("robot_agent.Path.write_bytes") as write_bytes:
-            scene = agent.describe_scene()
-        outcome = agent.run_turn("What can you see?", scene, lambda _: None)
+        output = io.StringIO()
+        with patch("robot_agent.Path.write_bytes") as write_bytes, redirect_stdout(output):
+            outcome = agent.run_turn("What can you see?", lambda _: None)
         self.assertEqual(outcome.reply, "I can see a desk.")
         write_bytes.assert_called_once_with(b"jpeg")
-        vision_call, agent_call = client.completions.calls
+        agent_call, vision_call, final_call = client.completions.calls
+        self.assertEqual(agent_call["model"], "openai/gpt-oss-120b")
+        self.assertNotIn("Camera report", agent_call["messages"][-1]["content"])
+        self.assertFalse(agent_call["parallel_tool_calls"])
         self.assertEqual(vision_call["model"], "qwen/qwen3.6-27b")
         self.assertEqual(vision_call["messages"][-1]["content"][1]["type"], "image_url")
-        self.assertEqual(agent_call["model"], "openai/gpt-oss-120b")
-        self.assertIsInstance(agent_call["messages"][-1]["content"], str)
-        self.assertIn(scene, agent_call["messages"][-1]["content"])
+        self.assertIn("Where is the desk?", vision_call["messages"][-1]["content"][0]["text"])
+        self.assertIn("[VISION] prompt:\nAnswer this visual question", output.getvalue())
+        self.assertIn("Where is the desk?", output.getvalue())
+        tool_result = next(message for message in final_call["messages"] if message["role"] == "tool")
+        self.assertEqual(json.loads(tool_result["content"])["observation"], "Scene: desk centered; path clear.")
         self.assertEqual(agent_call["reasoning_effort"], "low")
+
+    def test_conversation_does_not_capture_or_call_qwen(self):
+        camera = FakeCamera(value="data:image/jpeg;base64,anBlZw==")
+        agent, client = self.make_agent([response(content="Hello!")], camera)
+        outcome = agent.run_turn("Hello", lambda _: None)
+        self.assertEqual(outcome.reply, "Hello!")
+        self.assertEqual(camera.calls, 0)
+        self.assertEqual(len(client.completions.calls), 1)
 
     def test_deepgram_tts_uses_one_streaming_pcm_request(self):
         agent, _ = self.make_agent([])
@@ -145,8 +170,8 @@ class AgentLoopTests(unittest.TestCase):
             FakeCamera(value="data:image/jpeg;base64,anBlZw=="),
         )
         with patch("robot_agent.Path.write_bytes"):
-            report = agent.describe_scene()
-        self.assertEqual(len(report.removesuffix("…").split()), 100)
+            result = json.loads(agent.inspect_scene("Describe the relevant objects."))
+        self.assertEqual(len(result["observation"].removesuffix("…").split()), 100)
 
     def test_tool_executes_before_final_response(self):
         call = tool_call("one", "move", {"speed": 25, "distance": 40})
@@ -159,7 +184,7 @@ class AgentLoopTests(unittest.TestCase):
             seen.append(motion)
             return ActionResult(content=json.dumps({"status": "simulated"}))
 
-        outcome = agent.run_turn("Move a little", "Path clear.", act)
+        outcome = agent.run_turn("Move a little", act)
         self.assertEqual(seen, [MotionCall("move", 25, 40.0)])
         self.assertEqual(outcome.reply, "Movement simulated.")
         second_messages = client.completions.calls[1]["messages"]
@@ -175,41 +200,158 @@ class AgentLoopTests(unittest.TestCase):
             [response(tool_calls=[bad]), response(content="Please try that again.")]
         )
         outcome = agent.run_turn(
-            "Move", "Path clear.", lambda _: self.fail("invalid call reached executor")
+            "Move", lambda _: self.fail("invalid call reached executor")
         )
         self.assertEqual(outcome.reply, "Please try that again.")
 
     def test_four_call_limit(self):
         calls = [tool_call(str(i), "turn", {"speed": 20, "angle": 10}) for i in range(5)]
         agent, client = self.make_agent(
-            [response(tool_calls=calls), response(content="Four turns simulated.")]
+            [*(response(tool_calls=[call]) for call in calls), response(content="Four turns simulated.")]
         )
         executed = []
         outcome = agent.run_turn(
             "Turn repeatedly",
-            "Path clear.",
             lambda call: executed.append(call) or ActionResult(content="{}"),
         )
         self.assertEqual(len(executed), 4)
         self.assertEqual(outcome.reply, "Four turns simulated.")
-        self.assertNotIn("tools", client.completions.calls[1])
+        self.assertEqual(
+            [tool["function"]["name"] for tool in client.completions.calls[4]["tools"]],
+            ["inspect_scene"],
+        )
 
     def test_interruption_cancels_turn_without_second_request(self):
         call = tool_call("one", "move", {"speed": 25, "distance": 40})
         agent, client = self.make_agent([response(tool_calls=[call])])
         outcome = agent.run_turn(
             "Move",
-            "Path clear.",
             lambda _: ActionResult(interruption=b"new utterance"),
         )
         self.assertEqual(outcome.interruption, b"new utterance")
         self.assertEqual(len(client.completions.calls), 1)
         self.assertIn("cancelled", agent.history[-1]["content"])
 
+    def test_multiple_inspections_are_unlimited_and_use_fresh_frames(self):
+        first = tool_call("one", "inspect_scene", {"question": "What is ahead?"})
+        second = tool_call("two", "inspect_scene", {"question": "Is the path clear?"})
+        camera = FakeCamera(value="data:image/jpeg;base64,anBlZw==")
+        agent, client = self.make_agent(
+            [
+                response(tool_calls=[first]),
+                response(content="A chair is ahead."),
+                response(tool_calls=[second]),
+                response(content="The path is clear."),
+                response(content="The chair is ahead and the path looks clear."),
+            ],
+            camera,
+        )
+        with patch("robot_agent.Path.write_bytes"):
+            outcome = agent.run_turn("Can I approach the chair?", lambda _: None)
+        self.assertEqual(camera.calls, 2)
+        self.assertEqual(outcome.reply, "The chair is ahead and the path looks clear.")
+        self.assertEqual(
+            [call["model"] for call in client.completions.calls],
+            [
+                "openai/gpt-oss-120b",
+                "qwen/qwen3.6-27b",
+                "openai/gpt-oss-120b",
+                "qwen/qwen3.6-27b",
+                "openai/gpt-oss-120b",
+            ],
+        )
+
+    def test_inspection_does_not_consume_motion_limit(self):
+        inspect = tool_call("vision", "inspect_scene", {"question": "Is the path clear?"})
+        motions = [tool_call(str(i), "move", {"speed": 20, "distance": 10}) for i in range(4)]
+        agent, client = self.make_agent(
+            [
+                response(tool_calls=[inspect]),
+                response(content="The path is clear."),
+                *(response(tool_calls=[call]) for call in motions),
+                response(content="Four movements simulated."),
+            ],
+            FakeCamera(value="data:image/jpeg;base64,anBlZw=="),
+        )
+        executed = []
+        with patch("robot_agent.Path.write_bytes"):
+            outcome = agent.run_turn(
+                "Move four times if the path is clear",
+                lambda call: executed.append(call) or ActionResult(content="{}"),
+            )
+        self.assertEqual(len(executed), 4)
+        self.assertEqual(outcome.reply, "Four movements simulated.")
+        first_post_vision_request = client.completions.calls[2]
+        observation = next(
+            message for message in first_post_vision_request["messages"] if message["role"] == "tool"
+        )
+        self.assertEqual(json.loads(observation["content"])["observation"], "The path is clear.")
+
+    def test_malformed_inspection_never_uses_camera(self):
+        bad = tool_call("bad", "inspect_scene", {"question": ""})
+        camera = FakeCamera(value="data:image/jpeg;base64,anBlZw==")
+        agent, _ = self.make_agent(
+            [response(tool_calls=[bad]), response(content="Please clarify.")],
+            camera,
+        )
+        outcome = agent.run_turn("Look", lambda _: None)
+        self.assertEqual(outcome.reply, "Please clarify.")
+        self.assertEqual(camera.calls, 0)
+
+    def test_qwen_failure_is_returned_to_gpt_oss(self):
+        inspect = tool_call("vision", "inspect_scene", {"question": "What is ahead?"})
+        agent, client = self.make_agent(
+            [
+                response(tool_calls=[inspect]),
+                response(content=""),
+                response(content="I couldn't inspect the scene."),
+            ],
+            FakeCamera(value="data:image/jpeg;base64,anBlZw=="),
+        )
+        with patch("robot_agent.Path.write_bytes"):
+            outcome = agent.run_turn("What is ahead?", lambda _: None)
+        self.assertEqual(outcome.reply, "I couldn't inspect the scene.")
+        tool_result = next(
+            message
+            for message in client.completions.calls[-1]["messages"]
+            if message["role"] == "tool"
+        )
+        self.assertEqual(json.loads(tool_result["content"])["error"], "vision_failed")
+
+    def test_speech_during_qwen_discards_result(self):
+        inspect = tool_call("vision", "inspect_scene", {"question": "What is ahead?"})
+        agent, client = self.make_agent(
+            [response(tool_calls=[inspect]), response(content="A chair is ahead.")],
+            FakeCamera(value="data:image/jpeg;base64,anBlZw=="),
+        )
+        checks = 0
+
+        def cancelled():
+            nonlocal checks
+            checks += 1
+            return checks >= 5
+
+        with patch("robot_agent.Path.write_bytes"):
+            outcome = agent.run_turn("What is ahead?", lambda _: None, cancelled)
+        self.assertEqual(outcome.interruption, b"")
+        self.assertEqual(len(client.completions.calls), 2)
+
+    def test_parallel_tool_batch_executes_nothing(self):
+        inspect = tool_call("vision", "inspect_scene", {"question": "Is the path clear?"})
+        move = tool_call("move", "move", {"speed": 20, "distance": 30})
+        camera = FakeCamera(value="data:image/jpeg;base64,anBlZw==")
+        agent, _ = self.make_agent(
+            [response(tool_calls=[inspect, move]), response(content="I'll wait.")],
+            camera,
+        )
+        outcome = agent.run_turn("Move if clear", lambda _: self.fail("motion executed"))
+        self.assertEqual(outcome.reply, "I'll wait.")
+        self.assertEqual(camera.calls, 0)
+
     def test_camera_failure_falls_back(self):
         agent, _ = self.make_agent([], FakeCamera(error=RuntimeError("no camera")))
-        self.assertEqual(agent.describe_scene(), "Visual context unavailable.")
-        self.assertEqual(agent.describe_scene(), "Visual context unavailable.")
+        result = json.loads(agent.inspect_scene("What is ahead?"))
+        self.assertEqual(result["error"], "camera_unavailable")
 
 
 if __name__ == "__main__":

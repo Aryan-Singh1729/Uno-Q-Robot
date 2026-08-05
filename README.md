@@ -1,9 +1,10 @@
 # Scout robot simulator
 
-An English voice-and-vision robot simulator. When speech begins, Scout sends a
-fresh webcam frame to Groq Qwen for a compact scene report while recording
-continues. After transcription, GPT-OSS-120B receives only the transcript and
-scene report, then simulates validated `move` and `turn` calls in the terminal.
+An English voice-and-vision robot simulator. GPT-OSS-120B receives the user's
+transcript and decides whether it needs current visual context. Only then does
+it call the internal `inspect_scene` tool, which captures a fresh webcam frame
+and asks Groq Qwen a focused visual question. Scout simulates validated `move`
+and `turn` calls in the terminal.
 
 This version must not be connected to motors. A single webcam image cannot
 provide safe physical distance or angle estimates.
@@ -20,9 +21,9 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Put your Groq and Deepgram API keys in `.env`. Groq runs Whisper, Qwen vision,
-and the text-only GPT-OSS agent; Deepgram Aura-2 streams speech output from one
-request per reply. Scout listens while network requests and actions run.
+Put your Groq and Deepgram API keys in `.env`. Groq runs Whisper, on-demand Qwen
+vision, and the text-only GPT-OSS agent; Deepgram Aura-2 streams speech output
+from one request per reply. Scout listens while network requests and actions run.
 New speech cancels the active turn and pending motion immediately. Microphone
 processing is disabled only while Scout speaks, so its own output is ignored.
 
@@ -40,9 +41,10 @@ Run:
 python main.py
 ```
 
-Press `Ctrl+C` to stop. The exact JPEG sent with each LLM request overwrites
-`latest-frame.jpg` in the project directory; it is ignored by Git. Audio and
-generated speech stay in memory and are not retained.
+Press `Ctrl+C` to stop. No image is captured for requests that do not need
+vision. Whenever GPT-OSS requests an inspection, the exact JPEG sent to Qwen
+overwrites `latest-frame.jpg` in the project directory; it is ignored by Git.
+Images, audio, and generated speech are not retained in conversation history.
 
 ## Runtime device controls
 
@@ -77,6 +79,8 @@ utterance open. Run `/calibrate-mic` again whenever the room or mic gain changes
 - `turn`: speed 1–100%, angle -360–360 degrees; positive is left.
 - Zero distance/angle is rejected.
 - At most four motion calls are allowed per utterance.
+- `inspect_scene` calls do not count toward the four-motion limit and are not
+  given a separate limit.
 
 Every valid action is spoken before it is simulated. Speaking during that
 announcement does not interrupt Scout; microphone capture resumes before motion

@@ -1,9 +1,10 @@
 import io
 import unittest
 from contextlib import redirect_stdout
+from unittest.mock import patch
 
 from main import RobotApp, State
-from robot_agent import MotionCall, TurnOutcome
+from robot_agent import ActionResult, MotionCall, TargetMission, TargetObservation, TurnOutcome
 
 
 class FakeAgent:
@@ -87,18 +88,18 @@ class RobotAppActionTests(unittest.TestCase):
         app._process_turn(b"test wav")
         self.assertEqual(agent.turns, [("test phrase", False)])
 
-    def test_interrupting_utterance_gets_spoken_acknowledgement(self):
+    def test_interrupting_utterance_does_not_add_spoken_chatter(self):
         agent = FakeAgent()
         audio = FakeAudio()
         app = RobotApp(agent, audio)
         app.speech_generation = 1
         app.turn_generation = 1
         app._process_turn(b"test wav", interrupted=True)
-        self.assertEqual(agent.synthesized, ["Interrupt received."])
-        self.assertEqual(audio.played, [b"fake pcm"])
+        self.assertEqual(agent.synthesized, [])
+        self.assertEqual(audio.played, [])
         self.assertEqual(agent.turns, [("test phrase", False)])
 
-    def test_action_executes_only_after_announcement_finishes(self):
+    def test_action_logs_proposal_before_silent_execution(self):
         app = RobotApp(FakeAgent(), FakeAudio())
         output = io.StringIO()
         with redirect_stdout(output):
@@ -112,13 +113,13 @@ class RobotAppActionTests(unittest.TestCase):
         self.assertIsNotNone(result.content)
         self.assertEqual(app.state, State.PROCESSING)
 
-    def test_microphone_is_not_used_during_announcement(self):
+    def test_motion_is_silent(self):
         audio = FakeAudio()
         app = RobotApp(FakeAgent(), audio)
         output = io.StringIO()
         with redirect_stdout(output):
             result = app._handle_action(MotionCall("turn", 50, -90))
-        self.assertEqual(audio.played, [b"fake pcm"])
+        self.assertEqual(audio.played, [])
         self.assertIsNone(result.interruption)
         self.assertIn("[TOOL]", output.getvalue())
         self.assertEqual(app.state, State.PROCESSING)
@@ -137,20 +138,56 @@ class RobotAppActionTests(unittest.TestCase):
         self.assertIn("[CANCELLED]", output.getvalue())
         self.assertNotIn("[TOOL]", output.getvalue())
 
-    def test_speech_during_tts_request_cancels_before_playback(self):
+    def test_microphone_capture_is_paused_while_motors_run(self):
         audio = FakeAudio()
+        app = RobotApp(FakeAgent(), audio)
+
+        def observe_motion(_call, _stop):
+            self.assertFalse(app.can_listen.is_set())
+            self.assertTrue(app.capture_stop.is_set())
+            return '{"status":"completed"}'
+
+        with patch("main.execute_motion", side_effect=observe_motion):
+            result = app._handle_action(MotionCall("turn", 40, 90))
+        self.assertTrue(app.can_listen.is_set())
+        self.assertEqual(result.content, '{"status":"completed"}')
+
+    def test_target_mission_continues_search_align_and_approach_until_reached(self):
         agent = FakeAgent()
-        app = RobotApp(agent, audio)
+        observations = iter(
+            [
+                TargetObservation(False),
+                TargetObservation(False),
+                TargetObservation(True, "left", "small", False),
+                TargetObservation(True, "center", "medium", False),
+                TargetObservation(True, "center", "large", True),
+            ]
+        )
+        agent.locate_target = lambda *_args: next(observations)
+        app = RobotApp(agent, FakeAudio())
+        spoken = []
+        motions = []
+        app._speak = spoken.append
 
-        def interrupted_synthesis(text):
-            app.worker_busy.set()
-            app._on_speech_start()
-            return io.BytesIO(b"fake pcm")
+        def complete(call):
+            motions.append(call)
+            return ActionResult(content='{"status":"completed"}')
 
-        agent.synthesize = interrupted_synthesis
-        result = app._handle_action(MotionCall("turn", 40, 90))
-        self.assertEqual(result.interruption, b"")
-        self.assertEqual(audio.played, [])
+        app._handle_action = complete
+        app._run_target_mission(TargetMission("shoe", "toward"))
+        self.assertEqual(
+            motions,
+            [
+                MotionCall("turn", 45, 30.0),
+                MotionCall("turn", 45, 30.0),
+                MotionCall("turn", 40, 12.0),
+                MotionCall("move", 40, 15.0),
+            ],
+        )
+        self.assertEqual(
+            spoken,
+            ["Searching for shoe.", "I found the shoe. Moving toward it.", "I reached the shoe."],
+        )
 
     def test_microphone_processing_is_paused_only_for_playback(self):
         audio = FakeAudio()

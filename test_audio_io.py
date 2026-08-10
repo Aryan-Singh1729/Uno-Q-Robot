@@ -3,7 +3,7 @@ from collections import deque
 
 import numpy as np
 
-from audio_io import UtteranceDetector, VoiceIO, pcm_rms, pcm_to_wav, resample_pcm
+from audio_io import UtteranceDetector, VoiceIO, amplify_pcm, pcm_rms, pcm_to_wav, resample_pcm
 
 
 class UtteranceDetectorTests(unittest.TestCase):
@@ -114,6 +114,55 @@ class UtteranceDetectorTests(unittest.TestCase):
         )
         self.assertEqual(len(converted), len(source) * 2)
 
+    def test_pcm_gain_is_applied_and_clipped(self):
+        source = np.array([1000, -1000, 30000, -30000], dtype=np.int16).tobytes()
+        result = np.frombuffer(amplify_pcm(source, 1.4), dtype=np.int16).tolist()
+        self.assertEqual(result, [1400, -1400, 32767, -32768])
+
+    def test_usb_camera_microphone_is_preferred_over_analog_default(self):
+        class Default:
+            device = (0, 2)
+
+        class SoundDevice:
+            default = Default()
+
+            @staticmethod
+            def query_devices():
+                return [
+                    {"name": "Qualcomm analog input", "max_input_channels": 2},
+                    {"name": "USB Camera microphone", "max_input_channels": 1},
+                    {"name": "HDMI output", "max_input_channels": 0},
+                ]
+
+        voice = VoiceIO.__new__(VoiceIO)
+        voice.sd = SoundDevice
+        self.assertEqual(voice._automatic_input_device(), 1)
+
+    def test_emeet_smartcam_mic_beats_generic_usb_audio(self):
+        class Default:
+            device = (1, 1)
+
+        class SoundDevice:
+            default = Default()
+
+            @staticmethod
+            def query_devices():
+                return [
+                    {"name": "EMEET SmartCam C950: USB Audio", "max_input_channels": 1},
+                    {"name": "USB PnP Sound Device: Audio", "max_input_channels": 1},
+                ]
+
+        voice = VoiceIO.__new__(VoiceIO)
+        voice.sd = SoundDevice
+        self.assertEqual(voice._automatic_input_device(), 0)
+
+    def test_webcam_capture_is_resampled_to_vad_rate(self):
+        voice = VoiceIO.__new__(VoiceIO)
+        voice.input_rate = 48_000
+        source = np.arange(1_440, dtype=np.int16).tobytes()
+        converted = voice._capture_callback(source)
+        self.assertEqual(len(converted), 480 * 2)
+
     def test_pcm_response_is_played_as_chunks_arrive(self):
         writes = []
 
@@ -150,8 +199,12 @@ class UtteranceDetectorTests(unittest.TestCase):
         voice = VoiceIO.__new__(VoiceIO)
         voice.sd = SoundDevice
         voice.output_device = None
+        voice.playback_gain = 1.4
         voice.play(Stream())
-        self.assertEqual(writes, [b"\x01\x00", b"\x02\x00"])
+        self.assertEqual(
+            [np.frombuffer(chunk, dtype=np.int16).tolist() for chunk in writes],
+            [[1], [3]],
+        )
 
 
 if __name__ == "__main__":

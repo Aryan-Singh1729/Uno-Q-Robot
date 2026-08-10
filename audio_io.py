@@ -24,6 +24,7 @@ END_SILENCE_FRAMES = 3_000 // FRAME_MS
 END_SPEECH_RUN_FRAMES = 3
 MIN_SPEECH_FRAMES = 300 // FRAME_MS
 MAX_UTTERANCE_FRAMES = 60_000 // FRAME_MS
+INPUT_RATE_CANDIDATES = (SAMPLE_RATE, 48_000, 44_100, 32_000, 8_000)
 
 
 class UtteranceDetector:
@@ -132,6 +133,14 @@ def resample_pcm(
     return np.clip(np.rint(converted), limits.min, limits.max).astype(dtype).tobytes()
 
 
+def amplify_pcm(pcm: bytes, gain: float) -> bytes:
+    """Apply gain to mono int16 PCM while clipping instead of wrapping."""
+    if not pcm or gain == 1.0:
+        return pcm
+    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    return np.clip(np.rint(samples * gain), -32768, 32767).astype(np.int16).tobytes()
+
+
 def _device(value: str | None) -> int | str | None:
     if value is None or not value.strip():
         return None
@@ -141,7 +150,12 @@ def _device(value: str | None) -> int | str | None:
 class VoiceIO:
     """Real microphone capture and WAV playback."""
 
-    def __init__(self, input_device: str | None = None, output_device: str | None = None) -> None:
+    def __init__(
+        self,
+        input_device: str | None = None,
+        output_device: str | None = None,
+        playback_gain: float = 1.4,
+    ) -> None:
         try:
             import sounddevice
             import webrtcvad
@@ -150,10 +164,18 @@ class VoiceIO:
                 "Audio dependencies are missing. Run: pip install -r requirements.txt"
             ) from exc
         self.sd = sounddevice
-        self.vad = webrtcvad.Vad(3)
-        self.input_device = _device(input_device)
+        # Mode 2 is still noise-resistant, but is less likely than mode 3 to
+        # reject speech from the small microphones built into USB webcams.
+        self.vad = webrtcvad.Vad(2)
+        self.input_device: int | str | None = None
+        self.input_rate = SAMPLE_RATE
         self.output_device = _device(output_device)
-        self.speech_rms_threshold = 300.0
+        if not 0.1 <= playback_gain <= 3.0:
+            raise ValueError("playback gain must be between 0.1 and 3.0")
+        self.playback_gain = playback_gain
+        self.speech_rms_threshold = 120.0
+        self.set_input_device(input_device)
+        self._print_input_summary()
 
     @staticmethod
     def list_devices() -> None:
@@ -165,15 +187,65 @@ class VoiceIO:
 
     def set_input_device(self, value: str | None) -> str:
         candidate = _device(value)
+        if candidate is None:
+            candidate = self._automatic_input_device()
         info = self.sd.query_devices(candidate, "input")
-        self.sd.check_input_settings(
-            device=candidate,
-            channels=1,
-            dtype="int16",
-            samplerate=SAMPLE_RATE,
-        )
+        self.input_rate = self._supported_input_rate(candidate, info)
         self.input_device = candidate
         return str(info["name"])
+
+    def _automatic_input_device(self) -> int | str | None:
+        devices = self.sd.query_devices()
+        try:
+            default_input = int(self.sd.default.device[0])
+        except (AttributeError, IndexError, TypeError, ValueError):
+            default_input = -1
+
+        candidates: list[tuple[int, int]] = []
+        for index, info in enumerate(devices):
+            if int(info.get("max_input_channels", 0)) < 1:
+                continue
+            name = str(info.get("name", "")).lower()
+            score = 10 if index == default_input else 0
+            if "usb" in name:
+                score += 50
+            if "webcam" in name or "camera" in name or "uvc" in name:
+                score += 45
+            if "smartcam" in name or "emeet" in name:
+                score += 60
+            if "microphone" in name or " mic" in f" {name}":
+                score += 35
+            candidates.append((score, index))
+
+        if not candidates:
+            raise RuntimeError("no microphone input devices are visible to the UNO Q")
+        return max(candidates)[1]
+
+    def _supported_input_rate(self, device: int | str | None, info: object) -> int:
+        default_rate = round(float(info["default_samplerate"]))  # type: ignore[index]
+        rates = tuple(dict.fromkeys((*INPUT_RATE_CANDIDATES, default_rate)))
+        last_error: Exception | None = None
+        for rate in rates:
+            try:
+                self.sd.check_input_settings(
+                    device=device,
+                    channels=1,
+                    dtype="int16",
+                    samplerate=rate,
+                )
+                return rate
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f"microphone does not support PCM capture: {last_error}")
+
+    def _print_input_summary(self) -> None:
+        print("[AUDIO] input devices visible to UNO Q:")
+        for index, info in enumerate(self.sd.query_devices()):
+            if int(info.get("max_input_channels", 0)) > 0:
+                marker = " -> selected" if index == self.input_device else ""
+                print(f"[AUDIO]   {index}: {info['name']}{marker}")
+        selected = self.sd.query_devices(self.input_device, "input")
+        print(f"[AUDIO] capturing from {selected['name']} at {self.input_rate} Hz")
 
     def set_output_device(self, value: str | None) -> str:
         candidate = _device(value)
@@ -189,8 +261,20 @@ class VoiceIO:
     def calibrate_input(self, seconds: float = 1.5) -> float:
         levels = sorted(pcm_rms(frame) for frame in self._fixed_capture(seconds))
         percentile_90 = levels[round((len(levels) - 1) * 0.9)]
-        self.speech_rms_threshold = min(3_000.0, max(300.0, percentile_90 * 2.2))
+        self.speech_rms_threshold = min(3_000.0, max(120.0, percentile_90 * 2.2))
         return self.speech_rms_threshold
+
+    def _capture_callback(self, indata: bytes) -> bytes:
+        pcm = bytes(indata)
+        if self.input_rate != SAMPLE_RATE:
+            pcm = resample_pcm(
+                pcm,
+                channels=1,
+                dtype="int16",
+                source_rate=self.input_rate,
+                target_rate=SAMPLE_RATE,
+            )
+        return pcm
 
     def _fixed_capture(self, seconds: float) -> list[bytes]:
         frames: queue.Queue[bytes] = queue.Queue()
@@ -198,20 +282,22 @@ class VoiceIO:
         def callback(indata: bytes, _count: int, _time: object, status: object) -> None:
             if status:
                 print(f"[AUDIO] {status}")
+            # Keep PortAudio's real-time callback minimal. Resampling here can
+            # starve 48 kHz USB devices and produce repeated input overflows.
             frames.put(bytes(indata))
 
         captured: list[bytes] = []
         frame_count = max(1, math.ceil(seconds * 1_000 / FRAME_MS))
         with self.sd.RawInputStream(
-            samplerate=SAMPLE_RATE,
-            blocksize=FRAME_SAMPLES,
+            samplerate=self.input_rate,
+            blocksize=self.input_rate * FRAME_MS // 1_000,
             channels=1,
             dtype="int16",
             device=self.input_device,
             callback=callback,
         ):
             for _ in range(frame_count):
-                captured.append(frames.get(timeout=1))
+                captured.append(self._capture_callback(frames.get(timeout=1)))
         return captured
 
     def _is_speech(self, frame: bytes) -> bool:
@@ -265,8 +351,8 @@ class VoiceIO:
                 pass
 
         with self.sd.RawInputStream(
-            samplerate=SAMPLE_RATE,
-            blocksize=FRAME_SAMPLES,
+            samplerate=self.input_rate,
+            blocksize=self.input_rate * FRAME_MS // 1_000,
             channels=1,
             dtype="int16",
             device=self.input_device,
@@ -274,11 +360,31 @@ class VoiceIO:
         ):
             if on_ready:
                 on_ready()
+            diagnostic_started = time.monotonic()
+            diagnostic_peak = 0
+            diagnostic_rms = 0.0
             while not stop_event.is_set():
                 try:
-                    frame = frames.get(timeout=0.1)
+                    frame = self._capture_callback(frames.get(timeout=0.1))
                 except queue.Empty:
                     continue
+                samples = array("h", frame)
+                if samples:
+                    diagnostic_peak = max(diagnostic_peak, max(abs(sample) for sample in samples))
+                    diagnostic_rms = max(diagnostic_rms, pcm_rms(frame))
+                if time.monotonic() - diagnostic_started >= 5:
+                    print(
+                        f"[AUDIO] waiting for speech: peak={diagnostic_peak}, "
+                        f"max RMS={diagnostic_rms:.0f}, threshold={self.speech_rms_threshold:.0f}"
+                    )
+                    if diagnostic_peak < 20:
+                        print(
+                            "[AUDIO] no microphone signal; set MIC_DEVICE to the USB "
+                            "camera input ID shown above"
+                        )
+                    diagnostic_started = time.monotonic()
+                    diagnostic_peak = 0
+                    diagnostic_rms = 0.0
                 voiced = self._is_speech(frame)
                 started, audio = detector.push(frame, voiced)
                 if started and on_speech_start:
@@ -338,6 +444,7 @@ class VoiceIO:
                         source_rate=source_rate,
                         target_rate=output_rate,
                     )
+                pcm = amplify_pcm(pcm, self.playback_gain)
                 if pcm:
                     output.write(pcm)
         if pending:

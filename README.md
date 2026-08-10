@@ -1,115 +1,163 @@
-# Scout robot simulator
+# Optimus UNO Q autonomous voice robot - v13
 
-An English voice-and-vision robot simulator. GPT-OSS-120B receives the user's
-transcript and decides whether it needs current visual context. Only then does
-it call the internal `inspect_scene` tool, which captures a fresh webcam frame
-and asks Groq Qwen a focused visual question. Scout simulates validated `move`
-and `turn` calls in the terminal.
+This is one Arduino App Lab application containing both UNO Q processors:
 
-This version must not be connected to motors. A single webcam image cannot
-provide safe physical distance or angle estimates.
+- `python/main.py` launches microphone capture, transcription, autonomous tool calling,
+  camera inspection, the live Web UI, and speech output on the Linux MPU.
+- `sketch/sketch.ino` runs deterministic TB6612 motor control on the STM32 MCU.
+- Arduino App Lab Bridge connects them. No SSH launch or separate Arduino upload is used.
 
-## Setup (Linux)
+## Observe-think-act mode
 
-Install PortAudio using your distribution package manager (for Debian/Ubuntu,
-`sudo apt install libportaudio2`), then create a Python 3.13+ environment:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-```
-
-Put your Groq and Deepgram API keys in `.env`. Groq runs Whisper, on-demand Qwen
-vision, and the text-only GPT-OSS agent; Deepgram Aura-2 streams speech output
-from one request per reply. Scout listens while network requests and actions run.
-New speech cancels the active turn and pending motion immediately. Microphone
-processing is disabled only while Scout speaks, so its own output is ignored.
-
-Model overrides are `VISION_MODEL`, `LLM_MODEL`, and `DEEPGRAM_TTS_MODEL`.
-
-`GROQ_API_KEY` accepts one key or a comma-separated circular failover pool:
-
-```dotenv
-GROQ_API_KEY=gsk_first,gsk_second,gsk_third
-```
-
-On HTTP 429, the failed request immediately moves to the next key and wraps to
-the first after the last. Each key is tried at most once per request, so a fully
-rate-limited pool fails normally instead of retrying forever. Keys from the same
-Groq organization generally share organization-level limits. Use only authorized
-project keys; do not use multiple organizations to bypass Groq's published limits.
-
-List devices and configure `MIC_DEVICE` / `OUTPUT_DEVICE` in `.env` if needed:
-
-```bash
-python main.py --list-devices
-```
-
-Run:
-
-```bash
-python main.py
-```
-
-Press `Ctrl+C` to stop. No image is captured for requests that do not need
-vision. Whenever GPT-OSS requests an inspection, the exact JPEG sent to Qwen
-overwrites `latest-frame.jpg` in the project directory; it is ignored by Git.
-Images, audio, and generated speech are not retained in conversation history.
-
-## Runtime device controls
-
-The `.env` values are startup defaults. Enter these commands in the running
-terminal to test or switch sources without restarting; runtime changes are not
-written back to `.env`:
+The HC-SR04, VL53L0X, MPU6050, and YDLIDAR X2 integrations are not loaded as motion guards in
+this build. Disconnected or stale sensors cannot block a command. Direct forward/backward and
+left/right instructions are parsed deterministically instead of being inferred from conversation
+history. Find-and-move tasks run in a persistent camera loop that searches, aligns, approaches,
+and rechecks the goal after every short action. The MCU still stops if Python status polling
+disappears for 750 ms, and `/stop` remains available as an emergency brake.
 
 ```text
-/devices
-/status
-/mic 4
-/output 9
-/camera 1
-/test-mic 3
-/calibrate-mic
-/test-camera
-/help
-/quit
+microphone -> complete utterance -> Whisper transcript -> observe/plan
+           -> inspect camera -> move/turn/spin -> inspect again
+           -> silent validated motion -> Bridge RPC
+           -> TB6612 motor outputs
 ```
 
-Audio devices may be selected by numeric ID or a unique name fragment. Use
-`/mic default` or `/output default` to return to the operating-system default.
-`/test-mic` records only for the requested duration, prints signal/VAD metrics,
-transcribes the in-memory sample with Whisper, and does not save it.
-At startup and after `/mic` changes, stay quiet during the 1.5-second calibration;
-the resulting energy gate prevents steady background noise from holding an
-utterance open. Run `/calibrate-mic` again whenever the room or mic gain changes.
+## Hardware safety
 
-## Motion conventions
+- Raise the wheels for the first motor test.
+- Power the motors from a suitable external motor supply, not the UNO Q 3.3 V rail.
+- Join the motor-supply ground, both TB6612 grounds, and UNO Q ground.
+- Tie both TB6612 `STBY` inputs to D2, as required by the sketch.
+- Leave the X2 disconnected for this motor-only test.
+- Keep a physical power disconnect within reach.
 
-- `move`: speed 1–100%, distance -500–500 cm; positive is forward.
-- `turn`: speed 1–100%, angle -360–360 degrees; positive is left.
-- Zero distance/angle is rejected.
-- At most four motion calls are allowed per utterance.
-- `inspect_scene` calls do not count toward the four-motion limit and are not
-  given a separate limit.
+## App layout
 
-Every valid action is spoken before it is simulated. Speaking during that
-announcement does not interrupt Scout; microphone capture resumes before motion
-starts. Speech detected during motion sets its stop event and supersedes the old
-turn. The terminal simulation is instantaneous; a future motor implementation
-must poll the supplied stop event and brake safely.
+```text
+uno-q-robot/
+|-- app.yaml
+|-- python/
+|   |-- main.py
+|   `-- requirements.txt
+|-- sketch/
+|   |-- sketch.ino
+|   `-- sketch.yaml
+|-- main.py
+|-- audio_io.py
+|-- live_view.py
+|-- assets/
+|-- robot_agent.py
+|-- execute_motion_bridge.py
+|-- .env
+`-- ...
+```
+
+The root modules are deployed with the app and can also be unit-tested on a development PC.
+
+## Configuration
+
+Create `.env` in the imported App Lab app and set your own keys. Never export or share it.
+
+```env
+GROQ_API_KEY=gsk_replace_me
+DEEPGRAM_API_KEY=replace_me
+
+ROBOT_NAME=Scout
+LLM_MODEL=openai/gpt-oss-120b
+VISION_MODEL=qwen/qwen3.6-27b
+STT_MODEL=whisper-large-v3-turbo
+DEEPGRAM_TTS_MODEL=aura-2-thalia-en
+PLAYBACK_GAIN=1.4
+
+CAMERA_INDEX=0
+# MIC_DEVICE=0
+# OUTPUT_DEVICE=1
+
+# Sensor and LiDAR motion gating is not loaded in v13.
+```
+
+## Import and run
+
+1. Stop and delete the previous app so its build cache is not reused.
+2. Import the newest ZIP from this repository.
+3. Recreate `.env` with your private keys. You do not need to connect the LiDAR.
+4. Connect the UNO Q, powered hub, EMEET SmartCam, and audio output.
+5. Click **Run** once and let both sides finish building.
+6. Confirm these messages appear:
+
+```text
+[MCU] autonomy-v13 Bridge ready
+[MOTOR] UNO Q MCU bridge is ready
+[WEB] live camera view: http://arduinoq.local:7000
+[AUDIO] ... EMEET SmartCam ... -> selected
+```
+
+The Python app requires the exact `autonomy-v13` MCU handshake. If App Lab leaves an older
+sensor sketch flashed, startup fails explicitly instead of silently using stale firmware.
+
+For a direct test, keep the wheels raised and say:
+
+```text
+Move forward 5 centimeters at 50 percent speed.
+```
+
+Expected motion logs are:
+
+```text
+[PROPOSED] move(speed=50, distance=5)
+[STATE] acting
+[MOTOR] move started
+[MOTOR] motion ... finished: completed
+```
+
+In this build a disconnected X2 does not appear at startup and cannot block movement.
+
+For an autonomous test, put the robot on a clear floor and say:
+
+```text
+Find a shoe in this room and move toward it.
+```
+
+The controller inspects a frame, turns in fixed increments while searching, centers the target,
+and approaches in 15 cm steps (8 cm when it looks large), taking a fresh frame after every
+action. It speaks only three milestones: searching, target found/approaching, and target reached.
+Open `http://arduinoq.local:7000` in a browser while the app runs to see the shared live camera
+feed, task state, and emergency-stop button. The App Lab globe is only network/device status.
+
+## Audio and camera behavior
+
+Speech playback uses a 1.4 software gain (40% increase) by default. The app prefers
+EMEET/SmartCam microphones over generic USB audio devices. Audio received at
+48 kHz is resampled outside PortAudio's real-time callback to prevent input-overflow storms.
+A short post-playback cooldown prevents the robot hearing its own milestone. Microphone capture
+is also closed during each physical action, preventing motor and gearbox noise from being
+misclassified as an interrupt.
+
+Vision tries each `/dev/video*` node if the configured camera opens but returns no frame. The
+same camera object supplies both Qwen inspections and the Web UI feed, avoiding two processes
+fighting over the USB camera.
+
+## Controller envelope and calibration
+
+- `move`: speed 1-100%, signed distance up to 1000 cm; positive is forward.
+- `turn`: speed 1-100%, signed angle up to 3600 degrees; positive is left.
+- `spin`: speed 1-100%, signed duration up to 120 seconds; positive is left.
+- A target mission can use up to 240 short actions or 20 minutes.
+
+The sensor/obstacle refusal path is absent. The finite task containment, 750 ms MCU connection
+watchdog, Web UI emergency stop, App Lab Stop button, and physical power removal remain because
+they prevent a lost controller from leaving powered motors running.
+
+Motion remains open-loop because there are no wheel encoders. Measure the robot and update
+`CM_PER_SEC_AT_100` and `DEG_PER_SEC_AT_100` in `sketch/sketch.ino`. If a wheel spins in the
+wrong direction, change only its `*_POLARITY` constant from `1` to `-1`.
 
 ## Tests
-
-The tests use mocked Groq, Deepgram, and hardware objects:
 
 ```bash
 python -m unittest discover -v
 ```
 
-## UNO Q later
-
-Keep the Python agent on the UNO Q Debian MPU. Once the motor driver, encoders,
-wheel geometry, proximity sensing, and emergency stop are defined, replace the
-two simulator functions with Arduino Bridge calls to a deterministic MCU sketch.
+Desktop tests mock network, camera, audio, LiDAR data, and Bridge operations. Physical motion
+is enabled only inside Arduino App Lab after the versioned MCU readiness RPC succeeds.

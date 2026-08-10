@@ -1,0 +1,5 @@
+name: Optimus Autonomous Robot v13
+description: Persistent voice-driven target search and approach with live camera view
+bricks:
+  - arduino:web_ui
+icon: 🤖

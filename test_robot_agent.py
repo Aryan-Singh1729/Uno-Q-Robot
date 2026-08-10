@@ -1,6 +1,7 @@
 import io
 import json
 import math
+import sys
 import threading
 import unittest
 from contextlib import redirect_stdout
@@ -12,9 +13,12 @@ from robot_agent import (
     Camera,
     GroqRobot,
     MotionCall,
+    TargetMission,
     announcement,
     execute_motion,
     parse_api_keys,
+    parse_direct_motion,
+    parse_target_mission,
     validate_inspection,
     validate_motion,
 )
@@ -78,6 +82,51 @@ class FakeRateLimitError(Exception):
 
 
 class MotionValidationTests(unittest.TestCase):
+    def test_camera_falls_back_when_first_video_node_times_out(self):
+        opened = []
+
+        class Capture:
+            def __init__(self, index):
+                self.index = index
+                self.released = False
+
+            def set(self, *_args):
+                return True
+
+            def isOpened(self):
+                return True
+
+            def read(self):
+                return (self.index == 1, object())
+
+            def release(self):
+                self.released = True
+
+        class Encoded:
+            @staticmethod
+            def tobytes():
+                return b"jpeg"
+
+        fake_cv2 = SimpleNamespace(
+            CAP_V4L2=200,
+            CAP_PROP_FRAME_WIDTH=3,
+            CAP_PROP_FRAME_HEIGHT=4,
+            CAP_PROP_BUFFERSIZE=38,
+            CAP_PROP_FOURCC=6,
+            IMWRITE_JPEG_QUALITY=1,
+            VideoCapture=lambda index, _backend=None: opened.append(Capture(index)) or opened[-1],
+            VideoWriter_fourcc=lambda *_args: 123,
+            imencode=lambda *_args: (True, Encoded()),
+        )
+        camera = Camera(0)
+        with patch.dict(sys.modules, {"cv2": fake_cv2}), patch.object(
+            Camera, "_device_indices", return_value=[0, 1]
+        ):
+            result = camera.data_url()
+        self.assertEqual(camera.index, 1)
+        self.assertEqual(result, "data:image/jpeg;base64,anBlZw==")
+        self.assertTrue(opened[0].released)
+
     def test_comma_separated_api_keys(self):
         self.assertEqual(parse_api_keys(" first, second ,, third "), ["first", "second", "third"])
         with self.assertRaises(ValueError):
@@ -91,13 +140,18 @@ class MotionValidationTests(unittest.TestCase):
         self.assertIn("backward 80 centimeters", announcement(move))
         self.assertIn("left 90 degrees", announcement(turn))
 
+    def test_omitted_speed_defaults_to_fifty_percent(self):
+        self.assertEqual(validate_motion("move", {"distance": 50}), MotionCall("move", 50, 50.0))
+
     def test_invalid_motion_values(self):
         invalid = [
             ("move", {"speed": 0, "distance": 1}),
             ("move", {"speed": True, "distance": 1}),
             ("move", {"speed": 10, "distance": 0}),
-            ("move", {"speed": 10, "distance": 501}),
-            ("turn", {"speed": 10, "angle": -361}),
+            ("move", {"speed": 10, "distance": 1001}),
+            ("turn", {"speed": 10, "angle": -3601}),
+            ("spin", {"speed": 10, "seconds": 121}),
+            ("move", {"speed": 101, "distance": 1}),
             ("turn", {"speed": 10, "angle": math.inf}),
             ("dance", {"speed": 10, "angle": 1}),
             ("turn", {"speed": 10, "angle": 1, "extra": 2}),
@@ -119,12 +173,45 @@ class MotionValidationTests(unittest.TestCase):
             with self.subTest(arguments=arguments), self.assertRaises(ValueError):
                 validate_inspection(arguments)
 
+    def test_direct_motion_parser_keeps_directions_deterministic(self):
+        self.assertEqual(
+            parse_direct_motion("move forward by 50 centimeters"),
+            MotionCall("move", 50, 50.0),
+        )
+        self.assertEqual(
+            parse_direct_motion("move backwards 2 metres at 35 percent"),
+            MotionCall("move", 35, -200.0),
+        )
+        self.assertEqual(parse_direct_motion("turn left"), MotionCall("turn", 50, 45.0))
+        self.assertEqual(
+            parse_direct_motion("rotate right for 10 seconds at 40%"),
+            MotionCall("spin", 40, -10.0),
+        )
+        self.assertIsNone(parse_direct_motion("what do you see in front of you?"))
+
+    def test_target_mission_parser(self):
+        self.assertEqual(
+            parse_target_mission("Find a shoe in this room and move towards it."),
+            TargetMission("shoe", "toward"),
+        )
+        self.assertEqual(
+            parse_target_mission("locate the sofa and then move away from it"),
+            TargetMission("sofa", "away"),
+        )
+
 
 class AgentLoopTests(unittest.TestCase):
     def make_agent(self, responses, camera=None):
         client = FakeClient(responses)
         agent = GroqRobot("unused", client=client, camera=camera or FakeCamera())
         return agent, client
+
+    def test_physical_mode_prompt_forbids_camera_motion_estimates(self):
+        agent, _ = self.make_agent([])
+        agent.physical_motion = True
+        self.assertIn("control real motors", agent.system_prompt)
+        self.assertIn("Never claim exact physical distance or angle", agent.system_prompt)
+        self.assertNotIn("This is a terminal simulator", agent.system_prompt)
 
     def test_gpt_oss_requests_targeted_qwen_inspection(self):
         inspect = tool_call("vision", "inspect_scene", {"question": "Where is the desk?"})
@@ -161,6 +248,25 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(outcome.reply, "Hello!")
         self.assertEqual(camera.calls, 0)
         self.assertEqual(len(client.completions.calls), 1)
+
+    def test_target_locator_parses_strict_geometry_without_safety_advice(self):
+        agent, client = self.make_agent(
+            [
+                response(
+                    content=(
+                        '{"visible":true,"position":"left","scale":"medium",'
+                        '"reached":false,"description":"black shoe on floor"}'
+                    )
+                )
+            ],
+            FakeCamera(value="data:image/jpeg;base64,anBlZw=="),
+        )
+        observation = agent.locate_target("shoe")
+        self.assertTrue(observation.visible)
+        self.assertEqual(observation.position, "left")
+        self.assertEqual(observation.scale, "medium")
+        prompt = client.completions.calls[0]["messages"][-1]["content"][0]["text"]
+        self.assertIn("Do not evaluate obstacles", prompt)
 
     def test_rate_limited_keys_rotate_and_wrap(self):
         first = FakeClient([FakeRateLimitError(), response(content="Back on key one.")])
@@ -241,22 +347,20 @@ class AgentLoopTests(unittest.TestCase):
         )
         self.assertEqual(outcome.reply, "Please try that again.")
 
-    def test_four_call_limit(self):
-        calls = [tool_call(str(i), "turn", {"speed": 20, "angle": 10}) for i in range(5)]
+    def test_fresh_inspection_is_required_between_motions(self):
+        calls = [tool_call(str(i), "turn", {"speed": 20, "angle": 10}) for i in range(2)]
         agent, client = self.make_agent(
-            [*(response(tool_calls=[call]) for call in calls), response(content="Four turns simulated.")]
+            [*(response(tool_calls=[call]) for call in calls), response(content="Inspection required.")]
         )
         executed = []
         outcome = agent.run_turn(
             "Turn repeatedly",
             lambda call: executed.append(call) or ActionResult(content="{}"),
         )
-        self.assertEqual(len(executed), 4)
-        self.assertEqual(outcome.reply, "Four turns simulated.")
-        self.assertEqual(
-            [tool["function"]["name"] for tool in client.completions.calls[4]["tools"]],
-            ["inspect_scene"],
-        )
+        self.assertEqual(len(executed), 1)
+        self.assertEqual(outcome.reply, "Inspection required.")
+        tool_result = client.completions.calls[-1]["messages"][-1]["content"]
+        self.assertIn("fresh camera inspection required", tool_result)
 
     def test_interruption_cancels_turn_without_second_request(self):
         call = tool_call("one", "move", {"speed": 25, "distance": 40})
@@ -299,14 +403,18 @@ class AgentLoopTests(unittest.TestCase):
         )
 
     def test_inspection_does_not_consume_motion_limit(self):
-        inspect = tool_call("vision", "inspect_scene", {"question": "Is the path clear?"})
-        motions = [tool_call(str(i), "move", {"speed": 20, "distance": 10}) for i in range(4)]
+        inspect1 = tool_call("vision1", "inspect_scene", {"question": "Is the path clear?"})
+        inspect2 = tool_call("vision2", "inspect_scene", {"question": "Is it still clear?"})
+        motions = [tool_call(str(i), "move", {"speed": 20, "distance": 10}) for i in range(2)]
         agent, client = self.make_agent(
             [
-                response(tool_calls=[inspect]),
+                response(tool_calls=[inspect1]),
                 response(content="The path is clear."),
-                *(response(tool_calls=[call]) for call in motions),
-                response(content="Four movements simulated."),
+                response(tool_calls=[motions[0]]),
+                response(tool_calls=[inspect2]),
+                response(content="The path remains clear."),
+                response(tool_calls=[motions[1]]),
+                response(content="Two movements simulated."),
             ],
             FakeCamera(value="data:image/jpeg;base64,anBlZw=="),
         )
@@ -316,8 +424,8 @@ class AgentLoopTests(unittest.TestCase):
                 "Move four times if the path is clear",
                 lambda call: executed.append(call) or ActionResult(content="{}"),
             )
-        self.assertEqual(len(executed), 4)
-        self.assertEqual(outcome.reply, "Four movements simulated.")
+        self.assertEqual(len(executed), 2)
+        self.assertEqual(outcome.reply, "Two movements simulated.")
         first_post_vision_request = client.completions.calls[2]
         observation = next(
             message for message in first_post_vision_request["messages"] if message["role"] == "tool"

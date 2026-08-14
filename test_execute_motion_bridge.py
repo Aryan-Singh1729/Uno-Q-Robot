@@ -66,9 +66,9 @@ class BridgeMotionTests(unittest.TestCase):
                 "robot_status": [json.dumps({"motion_id": 7, "status": "completed", "reason": "duration reached"})],
             }
         )
-        result = json.loads(self.backend.execute_motion(MotionCall("move", 30, 20)))
+        result = json.loads(self.backend.execute_motion(MotionCall("move", 30, 2)))
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["distance"], 20)
+        self.assertEqual(result["seconds"], 2)
 
     def test_obstacle_start_is_not_reported_as_completed(self):
         FakeBridge.reset(
@@ -76,7 +76,7 @@ class BridgeMotionTests(unittest.TestCase):
                 "move_robot": [json.dumps({"motion_id": 2, "status": "obstacle", "reason": "path blocked"})]
             }
         )
-        result = json.loads(self.backend.execute_motion(MotionCall("move", 20, 10)))
+        result = json.loads(self.backend.execute_motion(MotionCall("move", 20, 1)))
         self.assertEqual(result["status"], "obstacle")
         self.assertFalse(any(method == "robot_status" for method, _ in FakeBridge.calls))
 
@@ -109,7 +109,7 @@ class BridgeMotionTests(unittest.TestCase):
                             "ready": True,
                             "status": "idle",
                             "motion_id": 0,
-                            "firmware_version": "autonomy-v13",
+                            "firmware_version": "timed-motion-v14",
                             "motor_test_mode": True,
                             "sensor_guard_enabled": False,
                         }

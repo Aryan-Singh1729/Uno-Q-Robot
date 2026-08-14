@@ -24,6 +24,37 @@ MAX_TASK_SECONDS = 600.0
 VISION_WORD_LIMIT = 100
 MAX_VISION_QUESTION_LENGTH = 300
 
+_NUMBER_WORD_VALUES = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
+}
+_NUMBER_WORD_PATTERN = "|".join((*_NUMBER_WORD_VALUES, "hundred"))
+
 INSPECT_SCENE_TOOL = {
     "type": "function",
     "function": {
@@ -53,21 +84,21 @@ MOTION_TOOLS = [
         "function": {
             "name": "move",
             "description": (
-                "Move the robot a signed distance. Positive centimeters move forward; "
-                "negative centimeters move backward."
+                "Drive for a signed duration. Positive seconds move forward; "
+                "negative seconds move backward."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "speed": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "distance": {
+                    "seconds": {
                         "type": "number",
-                        "minimum": -1000,
-                        "maximum": 1000,
+                        "minimum": -120,
+                        "maximum": 120,
                         "not": {"const": 0},
                     },
                 },
-                "required": ["distance"],
+                "required": ["seconds"],
                 "additionalProperties": False,
             },
         },
@@ -139,7 +170,7 @@ class MotionCall:
 
     @property
     def argument_name(self) -> str:
-        return {"move": "distance", "turn": "angle", "spin": "seconds"}[self.name]
+        return {"move": "seconds", "turn": "angle", "spin": "seconds"}[self.name]
 
     def arguments(self) -> dict[str, int | float]:
         return {"speed": self.speed, self.argument_name: self.amount}
@@ -190,22 +221,42 @@ def parse_target_mission(transcript: str) -> TargetMission | None:
     return TargetMission(target=target, behavior=behavior)
 
 
+def _number_before_unit(text: str, unit_pattern: str) -> float | None:
+    match = re.search(
+        rf"(?P<number>\d+(?:\.\d+)?|(?:(?:{_NUMBER_WORD_PATTERN})(?:[\s-]+|$))+?)"
+        rf"\s*(?:{unit_pattern})",
+        text,
+    )
+    if match is None:
+        return None
+    value = match.group("number").strip().replace("-", " ")
+    if re.fullmatch(r"\d+(?:\.\d+)?", value):
+        return float(value)
+    total = 0
+    current = 0
+    for word in value.split():
+        if word == "hundred":
+            current = max(1, current) * 100
+        else:
+            current += _NUMBER_WORD_VALUES[word]
+    total += current
+    return float(total)
+
+
 def parse_direct_motion(transcript: str) -> MotionCall | None:
     """Parse unambiguous motion speech without letting chat history redirect it."""
     text = " ".join(transcript.lower().replace("’", "'").split())
-    speed_match = re.search(
-        r"(?:\bat\s+)?(\d+(?:\.\d+)?)(?:\s*%|\s+percent\b)", text
-    )
-    speed = int(round(float(speed_match.group(1)))) if speed_match else 50
+    speed_value = _number_before_unit(text, r"%(?!\w)|percent\b")
+    speed = int(round(speed_value)) if speed_value is not None else 20
     if not 1 <= speed <= 100:
         return None
 
     if re.search(r"\b(?:rotate|spin)\b", text):
-        seconds_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:seconds?|secs?|s)\b", text)
-        if seconds_match:
+        seconds = _number_before_unit(text, r"seconds?\b|secs?\b|s\b")
+        if seconds is not None:
             direction = -1 if re.search(r"\bright\b", text) else 1
             return validate_motion(
-                "spin", {"speed": speed, "seconds": direction * float(seconds_match.group(1))}
+                "spin", {"speed": speed, "seconds": direction * seconds}
             )
 
     turn_match = re.search(r"\b(?:turn|rotate)\s+(left|right)\b", text)
@@ -219,18 +270,14 @@ def parse_direct_motion(transcript: str) -> MotionCall | None:
     move_match = re.search(r"\b(?:move|drive|go)\s+(?:all\s+(?:the\s+)?motors\s+)?(forward|forwards|backward|backwards)\b", text)
     if not move_match:
         return None
-    distance_match = re.search(
-        r"(\d+(?:\.\d+)?)\s*(centimeters?|centimetres?|cm|meters?|metres?|m)\b",
-        text,
-    )
-    distance = 20.0
-    if distance_match:
-        distance = float(distance_match.group(1))
-        if distance_match.group(2) in {"meter", "meters", "metre", "metres", "m"}:
-            distance *= 100.0
+    seconds = _number_before_unit(text, r"seconds?\b|secs?\b|s\b")
+    if seconds is None:
+        if re.search(r"\b(?:centimeters?|centimetres?|cm|meters?|metres?)\b", text):
+            raise ValueError("distance commands are disabled; specify a duration in seconds")
+        raise ValueError("specify the motion duration in seconds")
     if move_match.group(1).startswith("back"):
-        distance = -distance
-    return validate_motion("move", {"speed": speed, "distance": distance})
+        seconds = -seconds
+    return validate_motion("move", {"speed": speed, "seconds": seconds})
 
 
 def _json_object_from_text(text: str) -> dict[str, Any]:
@@ -259,15 +306,15 @@ def _number(value: Any, label: str) -> float:
 def validate_motion(name: str, arguments: Mapping[str, Any]) -> MotionCall:
     if name not in {"move", "turn", "spin"}:
         raise ValueError(f"unknown tool: {name}")
-    amount_name = {"move": "distance", "turn": "angle", "spin": "seconds"}[name]
+    amount_name = {"move": "seconds", "turn": "angle", "spin": "seconds"}[name]
     if set(arguments) not in ({amount_name}, {"speed", amount_name}):
         raise ValueError(f"{name} requires {amount_name} and optionally speed")
-    speed = arguments.get("speed", 50)
+    speed = arguments.get("speed", 20)
     if isinstance(speed, bool) or not isinstance(speed, int) or not 1 <= speed <= 100:
         raise ValueError("speed must be an integer from 1 through 100")
     label = amount_name
     amount = _number(arguments[label], label)
-    maximum = {"move": 1000, "turn": 3600, "spin": 120}[name]
+    maximum = {"move": 120, "turn": 3600, "spin": 120}[name]
     if amount == 0 or abs(amount) > maximum:
         raise ValueError(f"{label} must be non-zero and between -{maximum} and {maximum}")
     return MotionCall(name, speed, amount)
@@ -313,7 +360,7 @@ def announcement(call: MotionCall) -> str:
     if call.name == "move":
         direction = "forward" if call.amount > 0 else "backward"
         return (
-            f"I'm going to move {direction} {_format_number(abs(call.amount))} centimeters "
+            f"I'm going to move {direction} for {_format_number(abs(call.amount))} seconds "
             f"at {call.speed} percent speed."
         )
     direction = "left" if call.amount > 0 else "right"
@@ -329,7 +376,7 @@ def execute_motion(
 ) -> str:
     if stop_event is not None and stop_event.is_set():
         return json.dumps({"status": "cancelled", "reason": "user speech detected"})
-    unit = {"move": "cm", "turn": "deg", "spin": "s"}[call.name]
+    unit = {"move": "s", "turn": "deg", "spin": "s"}[call.name]
     print(
         f"[TOOL] {call.name}(speed={call.speed}%, "
         f"{call.argument_name}={_format_number(call.amount)}{unit}) -> simulated"
@@ -560,17 +607,18 @@ Only move when the user requests or clearly authorizes motion.
 Authorization must be present in the current utterance. Never repeat a motion merely because
 an older conversation turn requested it. A question such as "what do you see?" authorizes
 inspection and an answer only, never movement.
-Speed is 1-100 percent. Positive distance is forward; negative is backward.
+Speed is 1-100 percent. Positive move seconds drive forward; negative move seconds drive backward.
 Positive angle is left; negative is right.
 Positive spin seconds rotate left; negative spin seconds rotate right.
 You may contextually infer numeric values for words such as slow, fast, small, or large,
-but ask a brief question when a real motion request has no defensible distance or angle.
-If speed is omitted, use 50 percent without asking the user for a speed.
+but ask a brief question when a real motion request has no defensible duration or angle.
+Distance-based movement is disabled: never request centimeters or meters. For linear motion,
+use an exact duration in seconds. If speed is omitted, use 20 percent without asking.
 For a multi-step task, continue autonomously until the requested condition is visibly achieved,
 the camera fails, the user interrupts, or the task runtime ends. After every movement, call
 inspect_scene again before deciding the next movement. Search by turning in roughly 45-degree
 steps and inspecting each fresh view. When approaching a visual target, center it with small
-turns and advance in steps no larger than 20 cm, inspecting again after every step. Treat a
+turns and advance in short timed steps no longer than one second, inspecting after every step. Treat a
 target as reached only when it is visibly large and low/central in the frame. Never move after
 a failed visual inspection during an autonomous visual task. For "move away", first locate the
 target, face away from it, then move forward in short observed steps. Do not ask for confirmation
@@ -812,7 +860,7 @@ should move. Do not infer anything from earlier frames or from the wording of th
                 "model": self.llm_model,
                 "messages": messages,
                 "temperature": 0.2,
-                "max_completion_tokens": 800,
+                "max_completion_tokens": 400,
                 "reasoning_effort": "low",
                 "tools": TOOLS if motion_calls_used < MAX_MOTION_CALLS else [INSPECT_SCENE_TOOL],
                 "tool_choice": "auto",

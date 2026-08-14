@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import io
 import math
+import os
 import queue
+import shutil
+import subprocess
 import threading
 import time
 import wave
@@ -17,13 +20,16 @@ import numpy as np
 SAMPLE_RATE = 16_000
 FRAME_MS = 30
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1_000
-PRE_ROLL_FRAMES = 600 // FRAME_MS
-START_WINDOW_FRAMES = 10
-START_VOICED_FRAMES = 6
-END_SILENCE_FRAMES = 3_000 // FRAME_MS
+PRE_ROLL_FRAMES = 450 // FRAME_MS
+START_WINDOW_FRAMES = 8
+START_VOICED_FRAMES = 5
+# Three seconds of trailing silence made every command feel unresponsive.  A
+# 900 ms endpoint is long enough for normal gaps between words while returning
+# the utterance to speech-to-text more than two seconds sooner.
+END_SILENCE_FRAMES = 900 // FRAME_MS
 END_SPEECH_RUN_FRAMES = 3
 MIN_SPEECH_FRAMES = 300 // FRAME_MS
-MAX_UTTERANCE_FRAMES = 60_000 // FRAME_MS
+MAX_UTTERANCE_FRAMES = 20_000 // FRAME_MS
 INPUT_RATE_CANDIDATES = (SAMPLE_RATE, 48_000, 44_100, 32_000, 8_000)
 
 
@@ -141,6 +147,17 @@ def amplify_pcm(pcm: bytes, gain: float) -> bytes:
     return np.clip(np.rint(samples * gain), -32768, 32767).astype(np.int16).tobytes()
 
 
+def maximize_pcm(pcm: bytes, target_peak: int = 32_000) -> bytes:
+    """Peak-normalize clean TTS PCM close to int16 full scale without clipping."""
+    if not pcm:
+        return pcm
+    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+    peak = float(np.max(np.abs(samples)))
+    if peak == 0:
+        return pcm
+    return np.rint(samples * (target_peak / peak)).astype(np.int16).tobytes()
+
+
 def _device(value: str | None) -> int | str | None:
     if value is None or not value.strip():
         return None
@@ -154,7 +171,7 @@ class VoiceIO:
         self,
         input_device: str | None = None,
         output_device: str | None = None,
-        playback_gain: float = 1.4,
+        playback_gain: float = 3.0,
     ) -> None:
         try:
             import sounddevice
@@ -175,7 +192,40 @@ class VoiceIO:
         self.playback_gain = playback_gain
         self.speech_rms_threshold = 120.0
         self.set_input_device(input_device)
+        threading.Thread(
+            target=self._maximize_system_output,
+            name="audio-volume-setup",
+            daemon=True,
+        ).start()
         self._print_input_summary()
+
+    @staticmethod
+    def _maximize_system_output() -> None:
+        """Best-effort unmute and set the UNO Q's default output mixer to 100%."""
+        if os.name != "posix":
+            return
+        commands: list[list[str]] = []
+        if shutil.which("pactl"):
+            commands.extend(
+                [
+                    ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"],
+                    ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "100%"],
+                ]
+            )
+        if shutil.which("amixer"):
+            for control in ("Master", "Speaker", "PCM"):
+                commands.append(["amixer", "-q", "sset", control, "100%", "unmute"])
+        for command in commands:
+            try:
+                subprocess.run(
+                    command,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
 
     @staticmethod
     def list_devices() -> None:
@@ -258,7 +308,7 @@ class VoiceIO:
         output_name = str(self.sd.query_devices(self.output_device, "output")["name"])
         return input_name, output_name
 
-    def calibrate_input(self, seconds: float = 1.5) -> float:
+    def calibrate_input(self, seconds: float = 1.0) -> float:
         levels = sorted(pcm_rms(frame) for frame in self._fixed_capture(seconds))
         percentile_90 = levels[round((len(levels) - 1) * 0.9)]
         self.speech_rms_threshold = min(3_000.0, max(120.0, percentile_90 * 2.2))
@@ -397,8 +447,24 @@ class VoiceIO:
         return None
 
     def play(self, stream: object) -> None:
-        """Play Deepgram's 24 kHz mono int16 PCM response as it arrives."""
+        """Buffer one TTS utterance, then play one continuous PCM stream.
+
+        Resampling tiny network chunks independently introduced discontinuities,
+        while network jitter could starve PortAudio between writes.  TTS replies
+        are short, so buffering the utterance once gives gap-free playback and
+        lets resampling operate over the complete waveform.
+        """
         source_rate = 24_000
+        reader = getattr(stream, "read1", stream.read)
+        chunks: list[bytes] = []
+        while chunk := reader(65_536):
+            chunks.append(chunk)
+        pcm = b"".join(chunks)
+        if len(pcm) % 2:
+            raise RuntimeError("Deepgram returned an incomplete PCM sample")
+        if not pcm:
+            return
+
         output_rate = source_rate
         try:
             self.sd.check_output_settings(
@@ -428,24 +494,18 @@ class VoiceIO:
                     raise
                 time.sleep(0.2)
 
-        reader = getattr(stream, "read1", stream.read)
-        pending = b""
+        if output_rate != source_rate:
+            pcm = resample_pcm(
+                pcm,
+                channels=1,
+                dtype="int16",
+                source_rate=source_rate,
+                target_rate=output_rate,
+            )
+        pcm = (
+            maximize_pcm(pcm)
+            if self.playback_gain >= 3.0
+            else amplify_pcm(pcm, self.playback_gain)
+        )
         with output:
-            while chunk := reader(2_400):
-                pcm = pending + chunk
-                aligned = len(pcm) - len(pcm) % 2
-                pending = pcm[aligned:]
-                pcm = pcm[:aligned]
-                if output_rate != source_rate:
-                    pcm = resample_pcm(
-                        pcm,
-                        channels=1,
-                        dtype="int16",
-                        source_rate=source_rate,
-                        target_rate=output_rate,
-                    )
-                pcm = amplify_pcm(pcm, self.playback_gain)
-                if pcm:
-                    output.write(pcm)
-        if pending:
-            raise RuntimeError("Deepgram returned an incomplete PCM sample")
+            output.write(pcm)

@@ -103,7 +103,7 @@ class RobotAppActionTests(unittest.TestCase):
         app = RobotApp(FakeAgent(), FakeAudio())
         output = io.StringIO()
         with redirect_stdout(output):
-            result = app._handle_action(MotionCall("move", 30, 80))
+            result = app._handle_action(MotionCall("move", 30, 8))
         lines = output.getvalue().splitlines()
         proposed = next(i for i, line in enumerate(lines) if line.startswith("[PROPOSED]"))
         acting = next(i for i, line in enumerate(lines) if line == "[STATE] acting")
@@ -132,7 +132,7 @@ class RobotAppActionTests(unittest.TestCase):
         self.assertIn(app.capture_generation, app.interrupt_generations)
         output = io.StringIO()
         with redirect_stdout(output):
-            result = app._handle_action(MotionCall("move", 30, 80))
+            result = app._handle_action(MotionCall("move", 30, 8))
         self.assertEqual(result.interruption, b"")
         self.assertEqual(audio.played, [])
         self.assertIn("[CANCELLED]", output.getvalue())
@@ -178,10 +178,10 @@ class RobotAppActionTests(unittest.TestCase):
         self.assertEqual(
             motions,
             [
-                MotionCall("turn", 45, 30.0),
-                MotionCall("turn", 45, 30.0),
-                MotionCall("turn", 40, 12.0),
-                MotionCall("move", 40, 15.0),
+                MotionCall("spin", 20, 0.5),
+                MotionCall("spin", 20, 0.5),
+                MotionCall("spin", 20, 0.2),
+                MotionCall("move", 20, 0.75),
             ],
         )
         self.assertEqual(

@@ -67,15 +67,17 @@ class State(Enum):
     SPEAKING = "speaking"
 
 
-POST_PLAYBACK_MIC_COOLDOWN_SECONDS = 0.75
-POST_MOTION_MIC_COOLDOWN_SECONDS = 0.45
+POST_PLAYBACK_MIC_COOLDOWN_SECONDS = 0.20
+POST_MOTION_MIC_COOLDOWN_SECONDS = 0.15
 MISSION_TIMEOUT_SECONDS = 1200.0
 MAX_MISSION_ACTIONS = 240
-SEARCH_TURN_DEGREES = 30.0
-REACQUIRE_TURN_DEGREES = 12.0
-ALIGN_TURN_DEGREES = 12.0
-APPROACH_STEP_CM = 15.0
-FINAL_APPROACH_STEP_CM = 8.0
+SEARCH_SPIN_SECONDS = 0.50
+REACQUIRE_SPIN_SECONDS = 0.20
+ALIGN_SPIN_SECONDS = 0.20
+APPROACH_STEP_SECONDS = 0.75
+FINAL_APPROACH_STEP_SECONDS = 0.35
+AWAY_TURN_SECONDS = 2.0
+AWAY_DRIVE_SECONDS = 1.5
 
 
 @dataclass(frozen=True)
@@ -89,7 +91,7 @@ class Settings:
     tts_model: str = "aura-2-thalia-en"
     mic_device: str | None = None
     output_device: str | None = None
-    playback_gain: float = 1.4
+    playback_gain: float = 3.0
     camera_index: int = 0
 
 
@@ -210,6 +212,7 @@ class RobotApp:
             if self._turn_cancelled():
                 return
         self.set_state(State.PROCESSING)
+        turn_started = time.monotonic()
         try:
             transcript = self.agent.transcribe(wav)
         except Exception as exc:
@@ -221,6 +224,7 @@ class RobotApp:
         if not transcript:
             print("[STT] no speech recognized")
             return
+        print(f"[PERF] speech-to-text: {time.monotonic() - turn_started:.2f}s")
         print(f"You: {transcript}")
         if self.live_view is not None:
             self.live_view.publish_status("planning", transcript)
@@ -241,11 +245,13 @@ class RobotApp:
             return
 
         try:
+            planning_started = time.monotonic()
             outcome = self.agent.run_turn(
                 transcript,
                 self._handle_action,
                 self._turn_cancelled,
             )
+            print(f"[PERF] agent response: {time.monotonic() - planning_started:.2f}s")
         except Exception as exc:
             print(f"[LLM] request failed: {exc}")
             if not self._turn_cancelled():
@@ -299,18 +305,18 @@ class RobotApp:
             if not observation.visible:
                 missing_after_found += 1 if found else 0
                 if found and missing_after_found <= 4 and last_position in {"left", "right"}:
-                    amount = REACQUIRE_TURN_DEGREES if last_position == "left" else -REACQUIRE_TURN_DEGREES
+                    amount = REACQUIRE_SPIN_SECONDS if last_position == "left" else -REACQUIRE_SPIN_SECONDS
                 else:
-                    amount = SEARCH_TURN_DEGREES
+                    amount = SEARCH_SPIN_SECONDS
                     search_turns += 1
-                result = self._handle_action(MotionCall("turn", 45, amount))
+                result = self._handle_action(MotionCall("spin", 20, amount))
                 actions += 1
                 if not self._action_completed(result):
                     return
                 # A complete sweep with no sighting changes the viewpoint before scanning again.
-                if not found and search_turns >= round(360 / SEARCH_TURN_DEGREES):
+                if not found and search_turns >= 12:
                     search_turns = 0
-                    result = self._handle_action(MotionCall("move", 35, APPROACH_STEP_CM))
+                    result = self._handle_action(MotionCall("move", 20, APPROACH_STEP_SECONDS))
                     actions += 1
                     if not self._action_completed(result):
                         return
@@ -326,15 +332,15 @@ class RobotApp:
 
             if mission.behavior == "away":
                 if observation.position in {"left", "right"}:
-                    amount = ALIGN_TURN_DEGREES if observation.position == "left" else -ALIGN_TURN_DEGREES
-                    result = self._handle_action(MotionCall("turn", 40, amount))
+                    amount = ALIGN_SPIN_SECONDS if observation.position == "left" else -ALIGN_SPIN_SECONDS
+                    result = self._handle_action(MotionCall("spin", 20, amount))
                     actions += 1
                     if not self._action_completed(result):
                         return
                     continue
                 for call in (
-                    MotionCall("turn", 45, 180.0),
-                    MotionCall("move", 40, 30.0),
+                    MotionCall("spin", 20, AWAY_TURN_SECONDS),
+                    MotionCall("move", 20, AWAY_DRIVE_SECONDS),
                 ):
                     result = self._handle_action(call)
                     actions += 1
@@ -347,11 +353,11 @@ class RobotApp:
                 self._speak(f"I reached the {target}.")
                 return
             if observation.position in {"left", "right"}:
-                amount = ALIGN_TURN_DEGREES if observation.position == "left" else -ALIGN_TURN_DEGREES
-                result = self._handle_action(MotionCall("turn", 40, amount))
+                amount = ALIGN_SPIN_SECONDS if observation.position == "left" else -ALIGN_SPIN_SECONDS
+                result = self._handle_action(MotionCall("spin", 20, amount))
             else:
-                step = FINAL_APPROACH_STEP_CM if observation.scale == "large" else APPROACH_STEP_CM
-                result = self._handle_action(MotionCall("move", 40, step))
+                step = FINAL_APPROACH_STEP_SECONDS if observation.scale == "large" else APPROACH_STEP_SECONDS
+                result = self._handle_action(MotionCall("move", 20, step))
             actions += 1
             if not self._action_completed(result):
                 return
@@ -583,7 +589,7 @@ def load_settings() -> Settings:
     except ValueError as exc:
         raise RuntimeError("CAMERA_INDEX must be an integer") from exc
     try:
-        playback_gain = float(os.getenv("PLAYBACK_GAIN", "1.4"))
+        playback_gain = float(os.getenv("PLAYBACK_GAIN", "3.0"))
     except ValueError as exc:
         raise RuntimeError("PLAYBACK_GAIN must be numeric") from exc
     if not 0.1 <= playback_gain <= 3.0:

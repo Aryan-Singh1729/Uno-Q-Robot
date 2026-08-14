@@ -3,7 +3,15 @@ from collections import deque
 
 import numpy as np
 
-from audio_io import UtteranceDetector, VoiceIO, amplify_pcm, pcm_rms, pcm_to_wav, resample_pcm
+from audio_io import (
+    UtteranceDetector,
+    VoiceIO,
+    amplify_pcm,
+    maximize_pcm,
+    pcm_rms,
+    pcm_to_wav,
+    resample_pcm,
+)
 
 
 class UtteranceDetectorTests(unittest.TestCase):
@@ -14,7 +22,7 @@ class UtteranceDetectorTests(unittest.TestCase):
             self.assertFalse(started)
             self.assertIsNone(audio)
 
-    def test_preroll_and_three_second_silence_are_retained(self):
+    def test_preroll_and_low_latency_silence_are_retained(self):
         detector = UtteranceDetector()
         started_count = 0
         completed = None
@@ -24,25 +32,25 @@ class UtteranceDetectorTests(unittest.TestCase):
             started, audio = detector.push(b"v", True)
             started_count += started
             completed = audio if audio is not None else completed
-        for _ in range(100):
+        for _ in range(30):
             _, audio = detector.push(b"s", False)
             completed = audio if audio is not None else completed
         self.assertEqual(started_count, 1)
         self.assertIsNotNone(completed)
         self.assertTrue(completed.startswith(b"p"))
-        self.assertTrue(completed.endswith(b"s" * 100))
+        self.assertTrue(completed.endswith(b"s" * 30))
 
     def test_pause_shorter_than_threshold_does_not_finish(self):
         detector = UtteranceDetector()
         for _ in range(10):
             detector.push(b"v", True)
-        for _ in range(99):
+        for _ in range(29):
             _, audio = detector.push(b"s", False)
             self.assertIsNone(audio)
         for _ in range(3):
             detector.push(b"v", True)
         completed = None
-        for _ in range(100):
+        for _ in range(30):
             _, audio = detector.push(b"s", False)
             if audio is not None:
                 completed = audio
@@ -53,20 +61,20 @@ class UtteranceDetectorTests(unittest.TestCase):
         for _ in range(10):
             detector.push(b"v", True)
         completed = None
-        for index in range(100):
-            _, audio = detector.push(b"n", index in {20, 50, 80})
+        for index in range(30):
+            _, audio = detector.push(b"n", index in {8, 17, 26})
             if audio is not None:
                 completed = audio
         self.assertTrue(completed)
 
     def test_short_false_trigger_is_discarded(self):
         detector = UtteranceDetector()
-        for _ in range(6):
+        for _ in range(5):
             detector.push(b"v", True)
         completed = None
-        # Four initial silent frames complete the 10-frame start window, then
-        # 100 more are required for the configured three-second endpoint.
-        for _ in range(104):
+        # Three initial silent frames complete the 8-frame start window, then
+        # 30 more are required for the configured 900 ms endpoint.
+        for _ in range(33):
             _, audio = detector.push(b"s", False)
             if audio is not None:
                 completed = audio
@@ -119,6 +127,11 @@ class UtteranceDetectorTests(unittest.TestCase):
         result = np.frombuffer(amplify_pcm(source, 1.4), dtype=np.int16).tolist()
         self.assertEqual(result, [1400, -1400, 32767, -32768])
 
+    def test_pcm_can_be_peak_normalized_without_clipping(self):
+        source = np.array([1000, -2000, 500], dtype=np.int16).tobytes()
+        result = np.frombuffer(maximize_pcm(source), dtype=np.int16)
+        self.assertEqual(int(np.max(np.abs(result))), 32000)
+
     def test_usb_camera_microphone_is_preferred_over_analog_default(self):
         class Default:
             device = (0, 2)
@@ -163,7 +176,7 @@ class UtteranceDetectorTests(unittest.TestCase):
         converted = voice._capture_callback(source)
         self.assertEqual(len(converted), 480 * 2)
 
-    def test_pcm_response_is_played_as_chunks_arrive(self):
+    def test_pcm_response_is_buffered_for_continuous_playback(self):
         writes = []
 
         class Output:
@@ -201,10 +214,18 @@ class UtteranceDetectorTests(unittest.TestCase):
         voice.output_device = None
         voice.playback_gain = 1.4
         voice.play(Stream())
-        self.assertEqual(
-            [np.frombuffer(chunk, dtype=np.int16).tolist() for chunk in writes],
-            [[1], [3]],
-        )
+        self.assertEqual(len(writes), 1)
+        self.assertEqual(np.frombuffer(writes[0], dtype=np.int16).tolist(), [1, 3])
+
+    def test_incomplete_pcm_response_is_rejected_before_playback(self):
+        class Stream:
+            def read(self, _size):
+                value, self.value = getattr(self, "value", b"\x01"), b""
+                return value
+
+        voice = VoiceIO.__new__(VoiceIO)
+        with self.assertRaisesRegex(RuntimeError, "incomplete PCM"):
+            voice.play(Stream())
 
 
 if __name__ == "__main__":

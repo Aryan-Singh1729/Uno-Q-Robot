@@ -133,25 +133,25 @@ class MotionValidationTests(unittest.TestCase):
             parse_api_keys(" , ")
 
     def test_signed_move_and_turn(self):
-        move = validate_motion("move", {"speed": 30, "distance": -80})
+        move = validate_motion("move", {"speed": 30, "seconds": -8})
         turn = validate_motion("turn", {"speed": 45, "angle": 90})
-        self.assertEqual(move, MotionCall("move", 30, -80.0))
+        self.assertEqual(move, MotionCall("move", 30, -8.0))
         self.assertEqual(turn, MotionCall("turn", 45, 90.0))
-        self.assertIn("backward 80 centimeters", announcement(move))
+        self.assertIn("backward for 8 seconds", announcement(move))
         self.assertIn("left 90 degrees", announcement(turn))
 
-    def test_omitted_speed_defaults_to_fifty_percent(self):
-        self.assertEqual(validate_motion("move", {"distance": 50}), MotionCall("move", 50, 50.0))
+    def test_omitted_speed_defaults_to_twenty_percent(self):
+        self.assertEqual(validate_motion("move", {"seconds": 5}), MotionCall("move", 20, 5.0))
 
     def test_invalid_motion_values(self):
         invalid = [
-            ("move", {"speed": 0, "distance": 1}),
-            ("move", {"speed": True, "distance": 1}),
-            ("move", {"speed": 10, "distance": 0}),
-            ("move", {"speed": 10, "distance": 1001}),
+            ("move", {"speed": 0, "seconds": 1}),
+            ("move", {"speed": True, "seconds": 1}),
+            ("move", {"speed": 10, "seconds": 0}),
+            ("move", {"speed": 10, "seconds": 121}),
             ("turn", {"speed": 10, "angle": -3601}),
             ("spin", {"speed": 10, "seconds": 121}),
-            ("move", {"speed": 101, "distance": 1}),
+            ("move", {"speed": 101, "seconds": 1}),
             ("turn", {"speed": 10, "angle": math.inf}),
             ("dance", {"speed": 10, "angle": 1}),
             ("turn", {"speed": 10, "angle": 1, "extra": 2}),
@@ -164,7 +164,7 @@ class MotionValidationTests(unittest.TestCase):
     def test_motion_honors_speech_stop_event(self):
         stop = threading.Event()
         stop.set()
-        result = json.loads(execute_motion(MotionCall("move", 30, 80), stop))
+        result = json.loads(execute_motion(MotionCall("move", 30, 8), stop))
         self.assertEqual(result["status"], "cancelled")
 
     def test_inspection_question_validation(self):
@@ -175,19 +175,25 @@ class MotionValidationTests(unittest.TestCase):
 
     def test_direct_motion_parser_keeps_directions_deterministic(self):
         self.assertEqual(
-            parse_direct_motion("move forward by 50 centimeters"),
-            MotionCall("move", 50, 50.0),
+            parse_direct_motion("move forward for 5 seconds"),
+            MotionCall("move", 20, 5.0),
         )
         self.assertEqual(
-            parse_direct_motion("move backwards 2 metres at 35 percent"),
-            MotionCall("move", 35, -200.0),
+            parse_direct_motion("move backwards for 2 seconds at 35 percent"),
+            MotionCall("move", 35, -2.0),
         )
-        self.assertEqual(parse_direct_motion("turn left"), MotionCall("turn", 50, 45.0))
+        self.assertEqual(
+            parse_direct_motion("move forward for five seconds at twenty percent"),
+            MotionCall("move", 20, 5.0),
+        )
+        self.assertEqual(parse_direct_motion("turn left"), MotionCall("turn", 20, 45.0))
         self.assertEqual(
             parse_direct_motion("rotate right for 10 seconds at 40%"),
             MotionCall("spin", 40, -10.0),
         )
         self.assertIsNone(parse_direct_motion("what do you see in front of you?"))
+        with self.assertRaisesRegex(ValueError, "distance commands are disabled"):
+            parse_direct_motion("move forward by 50 centimeters")
 
     def test_target_mission_parser(self):
         self.assertEqual(
@@ -317,7 +323,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(len(result["observation"].removesuffix("…").split()), 100)
 
     def test_tool_executes_before_final_response(self):
-        call = tool_call("one", "move", {"speed": 25, "distance": 40})
+        call = tool_call("one", "move", {"speed": 25, "seconds": 4})
         agent, client = self.make_agent(
             [response(tool_calls=[call]), response(content="Movement simulated.")]
         )
@@ -328,7 +334,7 @@ class AgentLoopTests(unittest.TestCase):
             return ActionResult(content=json.dumps({"status": "simulated"}))
 
         outcome = agent.run_turn("Move a little", act)
-        self.assertEqual(seen, [MotionCall("move", 25, 40.0)])
+        self.assertEqual(seen, [MotionCall("move", 25, 4.0)])
         self.assertEqual(outcome.reply, "Movement simulated.")
         second_messages = client.completions.calls[1]["messages"]
         self.assertTrue(any(message["role"] == "tool" for message in second_messages))
@@ -363,7 +369,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("fresh camera inspection required", tool_result)
 
     def test_interruption_cancels_turn_without_second_request(self):
-        call = tool_call("one", "move", {"speed": 25, "distance": 40})
+        call = tool_call("one", "move", {"speed": 25, "seconds": 4})
         agent, client = self.make_agent([response(tool_calls=[call])])
         outcome = agent.run_turn(
             "Move",
@@ -405,7 +411,7 @@ class AgentLoopTests(unittest.TestCase):
     def test_inspection_does_not_consume_motion_limit(self):
         inspect1 = tool_call("vision1", "inspect_scene", {"question": "Is the path clear?"})
         inspect2 = tool_call("vision2", "inspect_scene", {"question": "Is it still clear?"})
-        motions = [tool_call(str(i), "move", {"speed": 20, "distance": 10}) for i in range(2)]
+        motions = [tool_call(str(i), "move", {"speed": 20, "seconds": 1}) for i in range(2)]
         agent, client = self.make_agent(
             [
                 response(tool_calls=[inspect1]),
@@ -483,7 +489,7 @@ class AgentLoopTests(unittest.TestCase):
 
     def test_parallel_tool_batch_executes_nothing(self):
         inspect = tool_call("vision", "inspect_scene", {"question": "Is the path clear?"})
-        move = tool_call("move", "move", {"speed": 20, "distance": 30})
+        move = tool_call("move", "move", {"speed": 20, "seconds": 3})
         camera = FakeCamera(value="data:image/jpeg;base64,anBlZw==")
         agent, _ = self.make_agent(
             [response(tool_calls=[inspect, move]), response(content="I'll wait.")],

@@ -8,13 +8,12 @@
 
 #include <Arduino_RouterBridge.h>
 
-static const float CM_PER_SEC_AT_100 = 30.0f;
 static const float DEG_PER_SEC_AT_100 = 180.0f;
-static const float MAX_COMMAND_DISTANCE_CM = 1000.0f;
+static const float MAX_DRIVE_SECONDS = 120.0f;
 static const float MAX_COMMAND_ANGLE_DEG = 3600.0f;
 static const float MAX_SPIN_SECONDS = 120.0f;
 static const int MAX_COMMAND_SPEED = 100;
-static const uint32_t MIN_MOTION_DURATION_MS = 250;
+static const uint32_t MIN_MOTION_DURATION_MS = 1;
 static const uint32_t MAX_MOTION_DURATION_MS = 600000;
 static const uint32_t SHORT_BRAKE_MS = 100;
 static const uint32_t CONTROLLER_WATCHDOG_MS = 750;
@@ -41,8 +40,10 @@ static const uint8_t D2_BIN2 = A2;
 // Change an individual value to -1 if that wheel spins opposite to the
 // commanded direction. Do not compensate by changing the turn logic.
 static const int FRONT_LEFT_POLARITY = 1;
-static const int FRONT_RIGHT_POLARITY = 1;
-static const int REAR_LEFT_POLARITY = 1;
+// Physical test result: these two diagonally-mounted motors are wired with
+// the opposite electrical polarity to the front-left and rear-right motors.
+static const int FRONT_RIGHT_POLARITY = -1;
+static const int REAR_LEFT_POLARITY = -1;
 static const int REAR_RIGHT_POLARITY = 1;
 
 uint32_t motionId = 0;
@@ -134,7 +135,7 @@ static String statusJson() {
   json += "\"motion_id\":" + String(motionId) + ",";
   json += "\"status\":\"" + jsonEscape(motionStatus) + "\",";
   json += "\"reason\":\"" + jsonEscape(motionReason) + "\",";
-  json += "\"firmware_version\":\"autonomy-v13\",";
+  json += "\"firmware_version\":\"timed-motion-v14\",";
   json += "\"motor_test_mode\":true,";
   json += "\"sensor_guard_enabled\":false";
   json += "}";
@@ -142,13 +143,13 @@ static String statusJson() {
 }
 
 static String startMotion(int speed, float amount, bool turning) {
-  const float maximum = turning ? MAX_COMMAND_ANGLE_DEG : MAX_COMMAND_DISTANCE_CM;
+  const float maximum = turning ? MAX_COMMAND_ANGLE_DEG : MAX_DRIVE_SECONDS;
   if (speed < 1 || speed > MAX_COMMAND_SPEED || !isfinite(amount) ||
       amount == 0.0f || fabs(amount) > maximum) {
     motionStatus = "error";
     motionReason = turning
       ? "invalid turn command"
-      : "invalid move command";
+      : "invalid timed drive command";
     return statusJson();
   }
 
@@ -157,9 +158,13 @@ static String startMotion(int speed, float amount, bool turning) {
     releaseMotorOutputs();
   }
 
-  const float rateAtSpeed = (turning ? DEG_PER_SEC_AT_100 : CM_PER_SEC_AT_100)
-                          * ((float)speed / 100.0f);
-  uint32_t durationMs = (uint32_t)((fabs(amount) / rateAtSpeed) * 1000.0f);
+  uint32_t durationMs;
+  if (turning) {
+    const float rateAtSpeed = DEG_PER_SEC_AT_100 * ((float)speed / 100.0f);
+    durationMs = (uint32_t)((fabs(amount) / rateAtSpeed) * 1000.0f);
+  } else {
+    durationMs = (uint32_t)(fabs(amount) * 1000.0f);
+  }
   durationMs = max(MIN_MOTION_DURATION_MS, durationMs);
   if (durationMs > MAX_MOTION_DURATION_MS) {
     motionStatus = "error";
@@ -190,8 +195,8 @@ static String startMotion(int speed, float amount, bool turning) {
   return json;
 }
 
-String move_robot(int speed, float distanceCm) {
-  return startMotion(speed, distanceCm, false);
+String move_robot(int speed, float seconds) {
+  return startMotion(speed, seconds, false);
 }
 
 String turn_robot(int speed, float angleDegrees) {
@@ -272,8 +277,8 @@ void setup() {
   Bridge.provide_safe("robot_status", robot_status);
   Bridge.provide_safe("read_sensors", read_sensors);
   bridgeReady = true;
-  motionReason = "autonomy-v13 ready";
-  Serial.println("[MCU] autonomy-v13 Bridge ready; sensor and obstacle guards disabled");
+  motionReason = "timed-motion-v14 ready";
+  Serial.println("[MCU] timed-motion-v14 Bridge ready; timed drive enabled");
 }
 
 void loop() {

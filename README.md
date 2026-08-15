@@ -1,4 +1,4 @@
-# Optimus UNO Q timed-motion voice robot - v14
+# Optimus UNO Q timed-motion voice robot - v14.2
 
 This is one Arduino App Lab application containing both UNO Q processors:
 
@@ -54,6 +54,9 @@ uno-q-robot/
 ```
 
 The root modules are deployed with the app and can also be unit-tested on a development PC.
+OpenCV is intentionally absent from `python/requirements.txt`: Arduino App Lab's ARM64 base
+image already supplies its custom OpenCV build. Requesting it again makes App Lab 0.9.0 try to
+resolve an internal build tag from the public package index and abort all Python provisioning.
 
 ## Configuration
 
@@ -87,13 +90,13 @@ CAMERA_INDEX=0
 6. Confirm these messages appear:
 
 ```text
-[MCU] timed-motion-v14 Bridge ready; timed drive enabled
+[MCU] motor-map-v14.2 Bridge ready; physical wheel mapping corrected
 [MOTOR] UNO Q MCU bridge is ready
 [WEB] live camera view: http://arduinoq.local:7000
 [AUDIO] ... EMEET SmartCam ... -> selected
 ```
 
-The Python app requires the exact `timed-motion-v14` MCU handshake. If App Lab leaves an older
+The Python app requires the exact `motor-map-v14.2` MCU handshake. If App Lab leaves an older
 sensor sketch flashed, startup fails explicitly instead of silently using stale firmware.
 
 For a direct test, keep the wheels raised and say:
@@ -154,7 +157,14 @@ they prevent a lost controller from leaving powered motors running.
 Linear distance estimation has been removed because there are no wheel encoders. A five-second
 move is now scheduled directly as 5000 ms on the MCU, independent of speed. Angular `turn`
 commands still use `DEG_PER_SEC_AT_100`; prefer `spin` when an exact rotation duration matters.
-The observed front-right and rear-left wheel wiring polarity is already set to `-1` in the sketch.
+The physical channel map is Driver 1 A = front-left, Driver 1 B = rear-right,
+Driver 2 A = front-right, and Driver 2 B = rear-left. The corresponding tested polarities are
+front-left `-1`, front-right `+1`, rear-left `+1`, and rear-right `-1`.
+
+If rear-left moves forward but remains still during backward and right-turn tests, inspect the
+`A2 -> BIN2` connection on Driver 2. Those three observations all use the same rear-left
+electrical state (`BIN1=LOW`, `BIN2=HIGH`), while its working direction proves PWM D9,
+`BIN1`, standby, motor power, and the motor itself can operate.
 
 ## Tests
 

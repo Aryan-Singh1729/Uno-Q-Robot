@@ -21,7 +21,8 @@ static const uint32_t CONTROLLER_WATCHDOG_MS = 750;
 // Both TB6612FNG STBY pins are tied to D2.
 static const uint8_t STBY_PIN = 2;
 
-// Driver 1: channel A front-left, channel B front-right.
+// Physical motor-output wiring supplied with the robot:
+// Driver 1: channel A front-left, channel B rear-right.
 static const uint8_t D1_PWMA = 3;
 static const uint8_t D1_AIN1 = 4;
 static const uint8_t D1_AIN2 = 7;
@@ -29,7 +30,7 @@ static const uint8_t D1_PWMB = 5;
 static const uint8_t D1_BIN1 = 8;
 static const uint8_t D1_BIN2 = 12;
 
-// Driver 2: channel A rear-left, channel B rear-right.
+// Driver 2: channel A front-right, channel B rear-left.
 static const uint8_t D2_PWMA = 6;
 static const uint8_t D2_AIN1 = 13;
 static const uint8_t D2_AIN2 = A0;
@@ -37,14 +38,13 @@ static const uint8_t D2_PWMB = 9;
 static const uint8_t D2_BIN1 = A1;
 static const uint8_t D2_BIN2 = A2;
 
-// Change an individual value to -1 if that wheel spins opposite to the
-// commanded direction. Do not compensate by changing the turn logic.
-static const int FRONT_LEFT_POLARITY = 1;
-// Physical test result: these two diagonally-mounted motors are wired with
-// the opposite electrical polarity to the front-left and rear-right motors.
-static const int FRONT_RIGHT_POLARITY = -1;
-static const int REAR_LEFT_POLARITY = -1;
-static const int REAR_RIGHT_POLARITY = 1;
+// Derived from the reported forward test for each physical wheel. These
+// values convert a logical forward command into that wheel's electrical
+// direction after applying the actual driver-channel mapping above.
+static const int FRONT_LEFT_POLARITY = -1;
+static const int FRONT_RIGHT_POLARITY = 1;
+static const int REAR_LEFT_POLARITY = 1;
+static const int REAR_RIGHT_POLARITY = -1;
 
 uint32_t motionId = 0;
 uint32_t motionDeadline = 0;
@@ -80,18 +80,18 @@ static void setMotor(uint8_t in1, uint8_t in2, uint8_t pwmPin, int direction, ui
 
 static void setAllMotors(int direction, uint8_t pwm) {
   setMotor(D1_AIN1, D1_AIN2, D1_PWMA, direction * FRONT_LEFT_POLARITY, pwm);
-  setMotor(D1_BIN1, D1_BIN2, D1_PWMB, direction * FRONT_RIGHT_POLARITY, pwm);
-  setMotor(D2_AIN1, D2_AIN2, D2_PWMA, direction * REAR_LEFT_POLARITY, pwm);
-  setMotor(D2_BIN1, D2_BIN2, D2_PWMB, direction * REAR_RIGHT_POLARITY, pwm);
+  setMotor(D1_BIN1, D1_BIN2, D1_PWMB, direction * REAR_RIGHT_POLARITY, pwm);
+  setMotor(D2_AIN1, D2_AIN2, D2_PWMA, direction * FRONT_RIGHT_POLARITY, pwm);
+  setMotor(D2_BIN1, D2_BIN2, D2_PWMB, direction * REAR_LEFT_POLARITY, pwm);
 }
 
 static void setTankTurn(int direction, uint8_t pwm) {
   const int left = direction > 0 ? -1 : 1;
   const int right = direction > 0 ? 1 : -1;
   setMotor(D1_AIN1, D1_AIN2, D1_PWMA, left * FRONT_LEFT_POLARITY, pwm);
-  setMotor(D2_AIN1, D2_AIN2, D2_PWMA, left * REAR_LEFT_POLARITY, pwm);
-  setMotor(D1_BIN1, D1_BIN2, D1_PWMB, right * FRONT_RIGHT_POLARITY, pwm);
-  setMotor(D2_BIN1, D2_BIN2, D2_PWMB, right * REAR_RIGHT_POLARITY, pwm);
+  setMotor(D2_BIN1, D2_BIN2, D2_PWMB, left * REAR_LEFT_POLARITY, pwm);
+  setMotor(D2_AIN1, D2_AIN2, D2_PWMA, right * FRONT_RIGHT_POLARITY, pwm);
+  setMotor(D1_BIN1, D1_BIN2, D1_PWMB, right * REAR_RIGHT_POLARITY, pwm);
 }
 
 static void releaseMotorOutputs() {
@@ -135,7 +135,8 @@ static String statusJson() {
   json += "\"motion_id\":" + String(motionId) + ",";
   json += "\"status\":\"" + jsonEscape(motionStatus) + "\",";
   json += "\"reason\":\"" + jsonEscape(motionReason) + "\",";
-  json += "\"firmware_version\":\"timed-motion-v14\",";
+  json += "\"firmware_version\":\"motor-map-v14.2\",";
+  json += "\"motor_map\":\"D1A=front_left,D1B=rear_right,D2A=front_right,D2B=rear_left\",";
   json += "\"motor_test_mode\":true,";
   json += "\"sensor_guard_enabled\":false";
   json += "}";
@@ -277,8 +278,8 @@ void setup() {
   Bridge.provide_safe("robot_status", robot_status);
   Bridge.provide_safe("read_sensors", read_sensors);
   bridgeReady = true;
-  motionReason = "timed-motion-v14 ready";
-  Serial.println("[MCU] timed-motion-v14 Bridge ready; timed drive enabled");
+  motionReason = "motor-map-v14.2 ready";
+  Serial.println("[MCU] motor-map-v14.2 Bridge ready; physical wheel mapping corrected");
 }
 
 void loop() {

@@ -50,9 +50,9 @@ def wait_for_mcu(timeout: float = BRIDGE_READY_TIMEOUT_SECONDS) -> dict[str, Any
         try:
             status = _decode_response(Bridge.call("robot_status"), "robot_status")
             if status.get("ready") is True:
-                if status.get("firmware_version") != "timed-motion-v14":
+                if status.get("firmware_version") != "motor-map-v14.2":
                     last_error = RuntimeError(
-                        "stale MCU sketch detected; App Lab did not flash timed-motion-v14"
+                        "stale MCU sketch detected; App Lab did not flash motor-map-v14.2"
                     )
                     time.sleep(0.25)
                     continue

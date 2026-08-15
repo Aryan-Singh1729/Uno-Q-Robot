@@ -1,10 +1,35 @@
 import io
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
 from main import RobotApp, State
 from robot_agent import ActionResult, MotionCall, TargetMission, TargetObservation, TurnOutcome
+
+
+class AppPackagingTests(unittest.TestCase):
+    def test_app_does_not_reinstall_app_lab_base_opencv(self):
+        requirements = Path("python/requirements.txt").read_text(encoding="utf-8").lower()
+        self.assertNotIn("opencv", requirements)
+
+    def test_sketch_matches_physical_motor_channel_table(self):
+        sketch = Path("sketch/sketch.ino").read_text(encoding="utf-8")
+        expected_lines = (
+            "static const int FRONT_LEFT_POLARITY = -1;",
+            "static const int FRONT_RIGHT_POLARITY = 1;",
+            "static const int REAR_LEFT_POLARITY = 1;",
+            "static const int REAR_RIGHT_POLARITY = -1;",
+            "setMotor(D1_BIN1, D1_BIN2, D1_PWMB, direction * REAR_RIGHT_POLARITY, pwm);",
+            "setMotor(D2_AIN1, D2_AIN2, D2_PWMA, direction * FRONT_RIGHT_POLARITY, pwm);",
+            "setMotor(D2_BIN1, D2_BIN2, D2_PWMB, direction * REAR_LEFT_POLARITY, pwm);",
+            "setMotor(D2_BIN1, D2_BIN2, D2_PWMB, left * REAR_LEFT_POLARITY, pwm);",
+            "setMotor(D2_AIN1, D2_AIN2, D2_PWMA, right * FRONT_RIGHT_POLARITY, pwm);",
+            "setMotor(D1_BIN1, D1_BIN2, D1_PWMB, right * REAR_RIGHT_POLARITY, pwm);",
+        )
+        for line in expected_lines:
+            with self.subTest(line=line):
+                self.assertIn(line, sketch)
 
 
 class FakeAgent:

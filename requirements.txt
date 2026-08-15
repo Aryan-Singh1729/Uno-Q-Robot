@@ -1,6 +1,5 @@
 groq
 numpy
-opencv-python-headless
 python-dotenv
 sounddevice
 webrtcvad-wheels

@@ -1,5 +1,5 @@
-name: WALL-E Timed-Motion Robot v15
-description: Cerebras-ready FIFO voice control, timed motion, persistent target search, and live camera view
+name: WALL-E Timed-Motion Robot v15.1
+description: USB-recovering Cerebras FIFO voice control, timed motion, persistent target search, and live camera view
 bricks:
   - arduino:web_ui
 icon: 🤖

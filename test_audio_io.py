@@ -177,6 +177,34 @@ class UtteranceDetectorTests(unittest.TestCase):
         converted = voice._capture_callback(source)
         self.assertEqual(len(converted), 480 * 2)
 
+    def test_usb_input_recovery_refreshes_portaudio_and_reselects_device(self):
+        calls = []
+
+        class SoundDevice:
+            class PortAudioError(Exception):
+                pass
+
+            @staticmethod
+            def stop():
+                calls.append("stop")
+
+            @staticmethod
+            def _terminate():
+                calls.append("terminate")
+
+            @staticmethod
+            def _initialize():
+                calls.append("initialize")
+
+        voice = VoiceIO.__new__(VoiceIO)
+        voice.sd = SoundDevice
+        voice.requested_input_device = None
+        voice.input_rate = 16_000
+        voice.set_input_device = lambda value: calls.append(("select", value)) or "EMEET"
+        self.assertEqual(voice.recover_input_device(), "EMEET")
+        self.assertEqual(calls, ["stop", "terminate", "initialize", ("select", None)])
+        self.assertTrue(voice.is_input_error(SoundDevice.PortAudioError("disconnected")))
+
     def test_pcm_response_is_played_as_chunks_arrive(self):
         writes = []
 

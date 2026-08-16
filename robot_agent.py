@@ -23,6 +23,8 @@ MAX_AGENT_STEPS = 100
 MAX_TASK_SECONDS = 600.0
 VISION_WORD_LIMIT = 100
 MAX_VISION_QUESTION_LENGTH = 300
+CAMERA_RETRY_INITIAL_SECONDS = 1.0
+CAMERA_RETRY_MAX_SECONDS = 10.0
 
 _NUMBER_WORD_VALUES = {
     "one": 1,
@@ -379,6 +381,8 @@ class Camera:
         self.capture: Any = None
         self.cv2: Any = None
         self._lock = threading.RLock()
+        self._retry_after = 0.0
+        self._retry_delay = CAMERA_RETRY_INITIAL_SECONDS
 
     @staticmethod
     def _device_indices(limit: int = 8) -> list[int]:
@@ -429,14 +433,20 @@ class Camera:
         self.cv2 = cv2
 
         frame = None
-        if self.capture is not None and self.capture.isOpened():
-            ok, current = self.capture.read()
-            if ok:
-                frame = current
+        if self.capture is not None:
+            if self.capture.isOpened():
+                ok, current = self.capture.read()
+                if ok:
+                    frame = current
+                else:
+                    self._release_capture()
             else:
-                self.close()
+                self._release_capture()
 
         if frame is None:
+            now = time.monotonic()
+            if now < self._retry_after:
+                raise RuntimeError("camera unavailable; waiting before reconnect scan")
             candidates = [self.index]
             candidates.extend(index for index in self._device_indices() if index != self.index)
             print(f"[VISION] trying camera indices: {candidates}")
@@ -450,7 +460,15 @@ class Camera:
                 self.index = index
                 break
         if frame is None:
-            raise RuntimeError(f"no camera returned a frame (tried {candidates})")
+            delay = self._retry_delay
+            self._retry_after = time.monotonic() + delay
+            self._retry_delay = min(CAMERA_RETRY_MAX_SECONDS, delay * 2.0)
+            raise RuntimeError(
+                f"no camera returned a frame (tried {candidates}); "
+                f"retrying after {delay:g}s"
+            )
+        self._retry_after = 0.0
+        self._retry_delay = CAMERA_RETRY_INITIAL_SECONDS
         ok, encoded = self.cv2.imencode(".jpg", frame, [self.cv2.IMWRITE_JPEG_QUALITY, 80])
         if not ok:
             raise RuntimeError("could not encode webcam frame")
@@ -459,14 +477,19 @@ class Camera:
 
     def close(self) -> None:
         with self._lock:
-            if self.capture is not None:
-                self.capture.release()
-                self.capture = None
+            self._release_capture()
+
+    def _release_capture(self) -> None:
+        if self.capture is not None:
+            self.capture.release()
+            self.capture = None
 
     def set_index(self, index: int) -> None:
         with self._lock:
             self.close()
             self.index = index
+            self._retry_after = 0.0
+            self._retry_delay = CAMERA_RETRY_INITIAL_SECONDS
 
     @staticmethod
     def available_indices(limit: int = 6) -> list[int]:

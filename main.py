@@ -69,6 +69,8 @@ class State(Enum):
 
 POST_PLAYBACK_MIC_COOLDOWN_SECONDS = 0.20
 POST_MOTION_MIC_COOLDOWN_SECONDS = 0.15
+AUDIO_RETRY_INITIAL_SECONDS = 1.0
+AUDIO_RETRY_MAX_SECONDS = 10.0
 MISSION_TIMEOUT_SECONDS = 1200.0
 MAX_MISSION_ACTIONS = 240
 SEARCH_SPIN_SECONDS = 0.50
@@ -117,6 +119,7 @@ class RobotApp:
         self.audio_lock = threading.Lock()
         self.worker_busy = threading.Event()
         self.motion_stop = threading.Event()
+        self.audio_retry_delay = AUDIO_RETRY_INITIAL_SECONDS
         self.worker: threading.Thread | None = None
 
     def set_state(self, state: State) -> None:
@@ -151,13 +154,7 @@ class RobotApp:
                     continue
                 if not self.worker_busy.is_set():
                     self.set_state(State.LISTENING)
-                self.listener_ready.clear()
-                wav = self.audio.capture(
-                    on_ready=self.listener_ready.set,
-                    on_speech_start=self._on_speech_start,
-                    stop_event=self.capture_stop,
-                )
-                self.listener_ready.clear()
+                wav = self._capture_utterance()
             if self._drain_commands():
                 wav = None
             if not self.running:
@@ -165,6 +162,44 @@ class RobotApp:
             if wav is None:
                 continue
             self.turn_queue.put(wav)
+
+    def _capture_utterance(self) -> bytes | None:
+        self.listener_ready.clear()
+        try:
+            wav = self.audio.capture(
+                on_ready=self.listener_ready.set,
+                on_speech_start=self._on_speech_start,
+                stop_event=self.capture_stop,
+            )
+            self.audio_retry_delay = AUDIO_RETRY_INITIAL_SECONDS
+            return wav
+        except Exception as exc:
+            is_input_error = getattr(self.audio, "is_input_error", lambda _exc: False)
+            if not is_input_error(exc):
+                raise
+            print(f"[AUDIO] USB microphone stream failed: {exc}")
+            if self.live_view is not None:
+                self.live_view.publish_status("audio_reconnecting", str(exc))
+            recovered = False
+            if self.running:
+                try:
+                    self.audio.recover_input_device()
+                    recovered = True
+                except Exception as recovery_error:
+                    print(f"[AUDIO] microphone unavailable; will retry: {recovery_error}")
+            delay = 0.5 if recovered else self.audio_retry_delay
+            if recovered:
+                self.audio_retry_delay = AUDIO_RETRY_INITIAL_SECONDS
+            else:
+                self.audio_retry_delay = min(
+                    AUDIO_RETRY_MAX_SECONDS,
+                    max(AUDIO_RETRY_INITIAL_SECONDS, self.audio_retry_delay * 2.0),
+                )
+            self.set_state(State.PROCESSING)
+            self.capture_stop.wait(delay)
+            return None
+        finally:
+            self.listener_ready.clear()
 
     def _on_speech_start(self) -> None:
         if self.worker_busy.is_set():

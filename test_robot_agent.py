@@ -127,6 +127,38 @@ class MotionValidationTests(unittest.TestCase):
         self.assertEqual(result, "data:image/jpeg;base64,anBlZw==")
         self.assertTrue(opened[0].released)
 
+    def test_disconnected_camera_backs_off_before_rescanning_usb_nodes(self):
+        open_count = 0
+
+        class Capture:
+            def set(self, *_args):
+                return True
+
+            @staticmethod
+            def isOpened():
+                return False
+
+            def release(self):
+                return None
+
+        def open_camera(_index):
+            nonlocal open_count
+            open_count += 1
+            return Capture()
+
+        fake_cv2 = SimpleNamespace(VideoCapture=open_camera)
+        camera = Camera(0)
+        with (
+            patch.dict(sys.modules, {"cv2": fake_cv2}),
+            patch.object(Camera, "_device_indices", return_value=[0]),
+            patch("robot_agent.time.monotonic", side_effect=[100.0, 100.0, 100.1]),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "retrying after 1s"):
+                camera.data_url()
+            with self.assertRaisesRegex(RuntimeError, "waiting before reconnect"):
+                camera.data_url()
+        self.assertEqual(open_count, 1)
+
     def test_comma_separated_api_keys(self):
         self.assertEqual(parse_api_keys(" first, second ,, third "), ["first", "second", "third"])
         with self.assertRaises(ValueError):

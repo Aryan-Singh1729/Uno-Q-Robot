@@ -183,6 +183,7 @@ class VoiceIO:
         self.sd = sounddevice
         self.vad = webrtcvad.Vad(3)
         self.input_device: int | str | None = None
+        self.requested_input_device = input_device
         self.input_rate = SAMPLE_RATE
         self.output_device = _device(output_device)
         if not 0.1 <= playback_gain <= 3.0:
@@ -234,6 +235,7 @@ class VoiceIO:
         print(sounddevice.query_devices())
 
     def set_input_device(self, value: str | None) -> str:
+        self.requested_input_device = value
         candidate = _device(value)
         if candidate is None:
             candidate = self._automatic_input_device()
@@ -241,6 +243,34 @@ class VoiceIO:
         self.input_rate = self._supported_input_rate(candidate, info)
         self.input_device = candidate
         return str(info["name"])
+
+    def is_input_error(self, exc: BaseException) -> bool:
+        """Return whether a failed PortAudio/ALSA capture can be retried."""
+        portaudio_error = getattr(self.sd, "PortAudioError", None)
+        retryable = (OSError,)
+        if isinstance(portaudio_error, type) and issubclass(portaudio_error, BaseException):
+            retryable += (portaudio_error,)
+        return isinstance(exc, retryable)
+
+    def recover_input_device(self) -> str:
+        """Refresh PortAudio after a USB microphone disconnect and select it again."""
+        stop = getattr(self.sd, "stop", None)
+        if callable(stop):
+            try:
+                stop()
+            except Exception:
+                pass
+        terminate = getattr(self.sd, "_terminate", None)
+        initialize = getattr(self.sd, "_initialize", None)
+        if callable(terminate) and callable(initialize):
+            try:
+                terminate()
+            except Exception:
+                pass
+            initialize()
+        name = self.set_input_device(self.requested_input_device)
+        print(f"[AUDIO] microphone recovered: {name} at {self.input_rate} Hz")
+        return name
 
     def _automatic_input_device(self) -> int | str | None:
         devices = self.sd.query_devices()

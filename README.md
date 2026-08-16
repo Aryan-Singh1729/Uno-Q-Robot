@@ -1,4 +1,4 @@
-# WALL-E UNO Q timed-motion voice robot - v15
+# WALL-E UNO Q timed-motion voice robot - v15.1
 
 This is one Arduino App Lab application containing both UNO Q processors:
 
@@ -145,6 +145,9 @@ EMEET/SmartCam microphones over generic USB audio devices. Audio received at
 A short post-playback cooldown prevents the robot hearing its own milestone. Completed commands
 are processed in FIFO order; newer speech does not cancel the active turn. Microphone capture is
 also closed during each physical action so motor and gearbox noise is not queued as a command.
+If the USB camera temporarily disconnects, the app refreshes PortAudio, reselects the microphone,
+and retries without terminating. Camera-node scans use exponential backoff up to 10 seconds so a
+missing composite camera/microphone cannot create a continuous ALSA/V4L2 retry storm.
 
 Vision tries each `/dev/video*` node if the configured camera opens but returns no frame. The
 same camera object supplies both Qwen inspections and the Web UI feed, avoiding two processes

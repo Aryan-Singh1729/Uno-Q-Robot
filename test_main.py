@@ -124,6 +124,35 @@ class RobotAppActionTests(unittest.TestCase):
         self.assertFalse(app.motion_stop.is_set())
         self.assertEqual(agent.turns, [])
 
+    def test_usb_microphone_failure_recovers_without_stopping_app(self):
+        class RecoveringAudio(FakeAudio):
+            def __init__(self):
+                super().__init__()
+                self.capture_calls = 0
+                self.recover_calls = 0
+
+            def capture(self, **_kwargs):
+                self.capture_calls += 1
+                if self.capture_calls == 1:
+                    raise OSError("ALSA device disappeared")
+                return b"recovered wav"
+
+            @staticmethod
+            def is_input_error(exc):
+                return isinstance(exc, OSError)
+
+            def recover_input_device(self):
+                self.recover_calls += 1
+                return "EMEET SmartCam"
+
+        audio = RecoveringAudio()
+        app = RobotApp(FakeAgent(), audio)
+        with patch.object(app.capture_stop, "wait", return_value=False):
+            self.assertIsNone(app._capture_utterance())
+        self.assertTrue(app.running)
+        self.assertEqual(audio.recover_calls, 1)
+        self.assertEqual(app._capture_utterance(), b"recovered wav")
+
     def test_completed_utterance_sends_transcript_without_eager_vision(self):
         agent = FakeAgent()
         app = RobotApp(agent, FakeAudio())

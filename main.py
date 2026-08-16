@@ -1,4 +1,4 @@
-"""Optimus UNO Q voice-and-vision robot controller entry point."""
+"""WALL-E UNO Q voice-and-vision robot controller entry point."""
 
 from __future__ import annotations
 
@@ -84,7 +84,8 @@ AWAY_DRIVE_SECONDS = 1.5
 class Settings:
     api_key: str
     deepgram_api_key: str
-    robot_name: str = "Scout"
+    cerebras_api_keys: str = ""
+    robot_name: str = "WALL-E"
     llm_model: str = "openai/gpt-oss-120b"
     vision_model: str = "qwen/qwen3.6-27b"
     stt_model: str = "whisper-large-v3-turbo"
@@ -108,7 +109,7 @@ class RobotApp:
         self.state: State | None = None
         self.running = True
         self.command_queue: queue.Queue[str] = queue.Queue()
-        self.turn_queue: queue.Queue[tuple[bytes, int] | None] = queue.Queue()
+        self.turn_queue: queue.Queue[bytes | None] = queue.Queue()
         self.capture_stop = threading.Event()
         self.can_listen = threading.Event()
         self.can_listen.set()
@@ -116,11 +117,6 @@ class RobotApp:
         self.audio_lock = threading.Lock()
         self.worker_busy = threading.Event()
         self.motion_stop = threading.Event()
-        self.generation_lock = threading.Lock()
-        self.speech_generation = 0
-        self.capture_generation = 0
-        self.turn_generation = 0
-        self.interrupt_generations: set[int] = set()
         self.worker: threading.Thread | None = None
 
     def set_state(self, state: State) -> None:
@@ -137,7 +133,7 @@ class RobotApp:
         if self.live_view is not None:
             self.live_view.set_emergency_stop(self._emergency_stop)
             self.live_view.start()
-        print("Microphone processing is disabled while Scout speaks.")
+        print(f"Microphone processing is disabled while {self.agent.robot_name} speaks.")
         print("Type /help for live device commands. Press Ctrl+C to stop.\n")
         self._calibrate_mic()
         threading.Thread(target=self._read_commands, name="console-commands", daemon=True).start()
@@ -168,49 +164,30 @@ class RobotApp:
                 break
             if wav is None:
                 continue
-            self.turn_queue.put((wav, self.capture_generation))
+            self.turn_queue.put(wav)
 
     def _on_speech_start(self) -> None:
-        with self.generation_lock:
-            self.speech_generation += 1
-            self.capture_generation = self.speech_generation
-            if self.worker_busy.is_set():
-                self.interrupt_generations.add(self.capture_generation)
-        self.motion_stop.set()
         if self.worker_busy.is_set():
-            print("[INTERRUPT] speech detected; cancelling the active turn and motion")
+            print("[QUEUE] speech detected; command will run after the active turn")
         self.set_state(State.RECORDING)
 
     def _turn_cancelled(self) -> bool:
-        with self.generation_lock:
-            return self.speech_generation > self.turn_generation
+        # Speech is FIFO and never cancels work. Explicit console/WebUI stops still do.
+        return self.motion_stop.is_set()
 
     def _process_turns(self) -> None:
         while self.running:
-            item = self.turn_queue.get()
-            if item is None:
+            wav = self.turn_queue.get()
+            if wav is None:
                 return
-            wav, generation = item
-            with self.generation_lock:
-                if generation < self.speech_generation:
-                    self.interrupt_generations.discard(generation)
-                    print("[PROCESSING] discarded superseded utterance")
-                    continue
-                self.turn_generation = generation
-                interrupted = generation in self.interrupt_generations
-                self.interrupt_generations.discard(generation)
-                self.motion_stop.clear()
+            self.motion_stop.clear()
             self.worker_busy.set()
             try:
-                self._process_turn(wav, interrupted)
+                self._process_turn(wav)
             finally:
                 self.worker_busy.clear()
 
-    def _process_turn(self, wav: bytes, interrupted: bool = False) -> None:
-        if interrupted:
-            print("[INTERRUPT] previous task stopped; processing the new command")
-            if self._turn_cancelled():
-                return
+    def _process_turn(self, wav: bytes) -> None:
         self.set_state(State.PROCESSING)
         turn_started = time.monotonic()
         try:
@@ -477,7 +454,7 @@ class RobotApp:
             elif command == "/quit":
                 self.running = False
                 self.capture_stop.set()
-                print("Stopping Scout.")
+                print(f"Stopping {self.agent.robot_name}.")
             else:
                 print(f"[CONFIG] unknown command: {line!r}; type /help")
         except Exception as exc:
@@ -597,7 +574,8 @@ def load_settings() -> Settings:
     return Settings(
         api_key=api_key,
         deepgram_api_key=deepgram_api_key,
-        robot_name=os.getenv("ROBOT_NAME", "Scout"),
+        cerebras_api_keys=os.getenv("CEREBRAS_API_KEYS", "").strip(),
+        robot_name=os.getenv("ROBOT_NAME", "WALL-E"),
         llm_model=os.getenv("LLM_MODEL", "openai/gpt-oss-120b"),
         vision_model=os.getenv("VISION_MODEL", "qwen/qwen3.6-27b"),
         stt_model=os.getenv("STT_MODEL", "whisper-large-v3-turbo"),
@@ -619,6 +597,7 @@ def create_robot_app() -> RobotApp:
     settings = load_settings()
     agent = GroqRobot(
         settings.api_key,
+        cerebras_api_keys=settings.cerebras_api_keys,
         robot_name=settings.robot_name,
         llm_model=settings.llm_model,
         vision_model=settings.vision_model,
@@ -629,6 +608,11 @@ def create_robot_app() -> RobotApp:
         physical_motion=HARDWARE_MOTION,
     )
     live_view = LiveCameraView(agent.camera) if HARDWARE_MOTION else None
+    llm_provider = "Cerebras" if settings.cerebras_api_keys else "Groq"
+    print(f"[MODEL] LLM: {llm_provider} / {agent.llm_model}")
+    print(f"[MODEL] STT: Groq / {agent.stt_model}")
+    print(f"[MODEL] Vision: Groq / {agent.vision_model}")
+    print(f"[MODEL] TTS: Deepgram / {agent.tts_model}")
     return RobotApp(
         agent,
         VoiceIO(settings.mic_device, settings.output_device, settings.playback_gain),
@@ -645,7 +629,7 @@ def run_robot_app() -> int:
     try:
         app.run()
     except KeyboardInterrupt:
-        print("\nStopping Scout.")
+        print("\nStopping WALL-E.")
     except Exception as exc:
         print(f"Error: {exc}")
         return 1

@@ -1,10 +1,12 @@
 import io
+import sys
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from main import RobotApp, State
+from main import RobotApp, State, load_settings
 from robot_agent import ActionResult, MotionCall, TargetMission, TargetObservation, TurnOutcome
 
 
@@ -12,6 +14,7 @@ class AppPackagingTests(unittest.TestCase):
     def test_app_does_not_reinstall_app_lab_base_opencv(self):
         requirements = Path("python/requirements.txt").read_text(encoding="utf-8").lower()
         self.assertNotIn("opencv", requirements)
+        self.assertIn("cerebras-cloud-sdk", requirements)
 
     def test_sketch_matches_physical_motor_channel_table(self):
         sketch = Path("sketch/sketch.ino").read_text(encoding="utf-8")
@@ -33,7 +36,7 @@ class AppPackagingTests(unittest.TestCase):
 
 
 class FakeAgent:
-    robot_name = "Scout"
+    robot_name = "WALL-E"
 
     def __init__(self):
         self.synthesized = []
@@ -98,28 +101,40 @@ class FakeAudio:
 
 
 class RobotAppActionTests(unittest.TestCase):
+    def test_cerebras_api_keys_are_loaded(self):
+        environment = {
+            "GROQ_API_KEY": "groq",
+            "CEREBRAS_API_KEYS": " first, second ",
+            "DEEPGRAM_API_KEY": "deepgram",
+        }
+        dotenv = SimpleNamespace(load_dotenv=lambda: None)
+        with (
+            patch.dict("os.environ", environment, clear=True),
+            patch.dict(sys.modules, {"dotenv": dotenv}),
+        ):
+            settings = load_settings()
+        self.assertEqual(settings.cerebras_api_keys, "first, second")
+        self.assertEqual(settings.robot_name, "WALL-E")
+
     def test_speech_start_does_not_launch_vision_processing(self):
         agent = FakeAgent()
         app = RobotApp(agent, FakeAudio())
         app._on_speech_start()
-        self.assertEqual(app.capture_generation, 1)
+        self.assertEqual(app.state, State.RECORDING)
+        self.assertFalse(app.motion_stop.is_set())
         self.assertEqual(agent.turns, [])
 
     def test_completed_utterance_sends_transcript_without_eager_vision(self):
         agent = FakeAgent()
         app = RobotApp(agent, FakeAudio())
-        app.speech_generation = 1
-        app.turn_generation = 1
         app._process_turn(b"test wav")
         self.assertEqual(agent.turns, [("test phrase", False)])
 
-    def test_interrupting_utterance_does_not_add_spoken_chatter(self):
+    def test_queued_utterance_does_not_add_spoken_chatter(self):
         agent = FakeAgent()
         audio = FakeAudio()
         app = RobotApp(agent, audio)
-        app.speech_generation = 1
-        app.turn_generation = 1
-        app._process_turn(b"test wav", interrupted=True)
+        app._process_turn(b"test wav")
         self.assertEqual(agent.synthesized, [])
         self.assertEqual(audio.played, [])
         self.assertEqual(agent.turns, [("test phrase", False)])
@@ -149,19 +164,19 @@ class RobotAppActionTests(unittest.TestCase):
         self.assertIn("[TOOL]", output.getvalue())
         self.assertEqual(app.state, State.PROCESSING)
 
-    def test_new_speech_cancels_pending_action(self):
+    def test_new_speech_does_not_cancel_pending_action(self):
         audio = FakeAudio()
         app = RobotApp(FakeAgent(), audio)
         app.worker_busy.set()
         app._on_speech_start()
-        self.assertIn(app.capture_generation, app.interrupt_generations)
+        self.assertFalse(app.motion_stop.is_set())
         output = io.StringIO()
         with redirect_stdout(output):
             result = app._handle_action(MotionCall("move", 30, 8))
-        self.assertEqual(result.interruption, b"")
+        self.assertIsNotNone(result.content)
         self.assertEqual(audio.played, [])
-        self.assertIn("[CANCELLED]", output.getvalue())
-        self.assertNotIn("[TOOL]", output.getvalue())
+        self.assertNotIn("[CANCELLED]", output.getvalue())
+        self.assertIn("[TOOL]", output.getvalue())
 
     def test_microphone_capture_is_paused_while_motors_run(self):
         audio = FakeAudio()

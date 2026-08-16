@@ -20,16 +20,16 @@ import numpy as np
 SAMPLE_RATE = 16_000
 FRAME_MS = 30
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1_000
-PRE_ROLL_FRAMES = 450 // FRAME_MS
-START_WINDOW_FRAMES = 8
-START_VOICED_FRAMES = 5
+PRE_ROLL_FRAMES = 600 // FRAME_MS
+START_WINDOW_FRAMES = 10
+START_VOICED_FRAMES = 6
 # Three seconds of trailing silence made every command feel unresponsive.  A
 # 900 ms endpoint is long enough for normal gaps between words while returning
 # the utterance to speech-to-text more than two seconds sooner.
-END_SILENCE_FRAMES = 900 // FRAME_MS
+END_SILENCE_FRAMES = 1_000 // FRAME_MS
 END_SPEECH_RUN_FRAMES = 3
 MIN_SPEECH_FRAMES = 300 // FRAME_MS
-MAX_UTTERANCE_FRAMES = 20_000 // FRAME_MS
+MAX_UTTERANCE_FRAMES = 60_000 // FRAME_MS
 INPUT_RATE_CANDIDATES = (SAMPLE_RATE, 48_000, 44_100, 32_000, 8_000)
 
 
@@ -181,16 +181,14 @@ class VoiceIO:
                 "Audio dependencies are missing. Run: pip install -r requirements.txt"
             ) from exc
         self.sd = sounddevice
-        # Mode 2 is still noise-resistant, but is less likely than mode 3 to
-        # reject speech from the small microphones built into USB webcams.
-        self.vad = webrtcvad.Vad(2)
+        self.vad = webrtcvad.Vad(3)
         self.input_device: int | str | None = None
         self.input_rate = SAMPLE_RATE
         self.output_device = _device(output_device)
         if not 0.1 <= playback_gain <= 3.0:
             raise ValueError("playback gain must be between 0.1 and 3.0")
         self.playback_gain = playback_gain
-        self.speech_rms_threshold = 120.0
+        self.speech_rms_threshold = 300.0
         self.set_input_device(input_device)
         threading.Thread(
             target=self._maximize_system_output,
@@ -308,10 +306,10 @@ class VoiceIO:
         output_name = str(self.sd.query_devices(self.output_device, "output")["name"])
         return input_name, output_name
 
-    def calibrate_input(self, seconds: float = 1.0) -> float:
+    def calibrate_input(self, seconds: float = 1.5) -> float:
         levels = sorted(pcm_rms(frame) for frame in self._fixed_capture(seconds))
         percentile_90 = levels[round((len(levels) - 1) * 0.9)]
-        self.speech_rms_threshold = min(3_000.0, max(120.0, percentile_90 * 2.2))
+        self.speech_rms_threshold = min(3_000.0, max(300.0, percentile_90 * 2.2))
         return self.speech_rms_threshold
 
     def _capture_callback(self, indata: bytes) -> bytes:
@@ -447,24 +445,8 @@ class VoiceIO:
         return None
 
     def play(self, stream: object) -> None:
-        """Buffer one TTS utterance, then play one continuous PCM stream.
-
-        Resampling tiny network chunks independently introduced discontinuities,
-        while network jitter could starve PortAudio between writes.  TTS replies
-        are short, so buffering the utterance once gives gap-free playback and
-        lets resampling operate over the complete waveform.
-        """
+        """Play Deepgram PCM incrementally as network chunks arrive."""
         source_rate = 24_000
-        reader = getattr(stream, "read1", stream.read)
-        chunks: list[bytes] = []
-        while chunk := reader(65_536):
-            chunks.append(chunk)
-        pcm = b"".join(chunks)
-        if len(pcm) % 2:
-            raise RuntimeError("Deepgram returned an incomplete PCM sample")
-        if not pcm:
-            return
-
         output_rate = source_rate
         try:
             self.sd.check_output_settings(
@@ -494,18 +476,28 @@ class VoiceIO:
                     raise
                 time.sleep(0.2)
 
-        if output_rate != source_rate:
-            pcm = resample_pcm(
-                pcm,
-                channels=1,
-                dtype="int16",
-                source_rate=source_rate,
-                target_rate=output_rate,
-            )
-        pcm = (
-            maximize_pcm(pcm)
-            if self.playback_gain >= 3.0
-            else amplify_pcm(pcm, self.playback_gain)
-        )
+        reader = getattr(stream, "read1", stream.read)
+        pending = b""
         with output:
-            output.write(pcm)
+            while chunk := reader(2_400):
+                pcm = pending + chunk
+                aligned = len(pcm) - len(pcm) % 2
+                pending = pcm[aligned:]
+                pcm = pcm[:aligned]
+                if output_rate != source_rate:
+                    pcm = resample_pcm(
+                        pcm,
+                        channels=1,
+                        dtype="int16",
+                        source_rate=source_rate,
+                        target_rate=output_rate,
+                    )
+                pcm = (
+                    maximize_pcm(pcm)
+                    if self.playback_gain >= 3.0
+                    else amplify_pcm(pcm, self.playback_gain)
+                )
+                if pcm:
+                    output.write(pcm)
+        if pending:
+            raise RuntimeError("Deepgram returned an incomplete PCM sample")

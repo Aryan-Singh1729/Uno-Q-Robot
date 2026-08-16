@@ -1,4 +1,4 @@
-# Optimus UNO Q timed-motion voice robot - v14.2
+# WALL-E UNO Q timed-motion voice robot - v15
 
 This is one Arduino App Lab application containing both UNO Q processors:
 
@@ -17,8 +17,8 @@ and rechecks the goal after every short timed action. The MCU still stops if Pyt
 disappears for 750 ms, and `/stop` remains available as an emergency brake.
 
 ```text
-microphone -> complete utterance -> Whisper transcript -> observe/plan
-           -> inspect camera -> move/turn/spin -> inspect again
+microphone -> FIFO utterance queue -> Whisper transcript -> observe/plan
+           -> inspect camera -> move/timed turn -> inspect again
            -> silent validated motion -> Bridge RPC
            -> TB6612 motor outputs
 ```
@@ -64,9 +64,11 @@ Create `.env` in the imported App Lab app and set your own keys. Never export or
 
 ```env
 GROQ_API_KEY=gsk_replace_me
+# Optional: text planning uses Cerebras when one or more keys are provided.
+CEREBRAS_API_KEYS=
 DEEPGRAM_API_KEY=replace_me
 
-ROBOT_NAME=Scout
+ROBOT_NAME=WALL-E
 LLM_MODEL=openai/gpt-oss-120b
 VISION_MODEL=qwen/qwen3.6-27b
 STT_MODEL=whisper-large-v3-turbo
@@ -77,8 +79,13 @@ CAMERA_INDEX=0
 # MIC_DEVICE=0
 # OUTPUT_DEVICE=1
 
-# Sensor and LiDAR motion gating is not loaded in v14.
+# Sensor and LiDAR motion gating is not loaded in v15.
 ```
+
+When `CEREBRAS_API_KEYS` is non-empty, text planning uses Cerebras while Groq continues to
+provide Whisper transcription and Qwen vision. Comma-separated Cerebras keys rotate only after
+HTTP 429. `openai/gpt-oss-120b` is translated to Cerebras model ID `gpt-oss-120b`; set
+`LLM_MODEL=zai-glm-4.7` to use GLM 4.7 instead.
 
 ## Import and run
 
@@ -108,7 +115,7 @@ Move forward for five seconds at twenty percent speed.
 Expected motion logs are:
 
 ```text
-[PROPOSED] move(speed=20, seconds=5)
+[PROPOSED] move(speed=20, duration_seconds=5)
 [STATE] acting
 [MOTOR] move started
 [MOTOR] motion ... finished: completed
@@ -131,13 +138,13 @@ feed, task state, and emergency-stop button. The App Lab globe is only network/d
 ## Audio and camera behavior
 
 Speech playback uses maximum clean peak normalization and requests 100% system mixer volume by
-default. Each TTS response is buffered and resampled as one continuous waveform to avoid gaps.
+default. TTS PCM is played incrementally as network chunks arrive, reducing time to first audio.
 The app prefers
 EMEET/SmartCam microphones over generic USB audio devices. Audio received at
 48 kHz is resampled outside PortAudio's real-time callback to prevent input-overflow storms.
-A short post-playback cooldown prevents the robot hearing its own milestone. Microphone capture
-is also closed during each physical action, preventing motor and gearbox noise from being
-misclassified as an interrupt.
+A short post-playback cooldown prevents the robot hearing its own milestone. Completed commands
+are processed in FIFO order; newer speech does not cancel the active turn. Microphone capture is
+also closed during each physical action so motor and gearbox noise is not queued as a command.
 
 Vision tries each `/dev/video*` node if the configured camera opens but returns no frame. The
 same camera object supplies both Qwen inspections and the Web UI feed, avoiding two processes
@@ -145,9 +152,10 @@ fighting over the USB camera.
 
 ## Controller envelope and calibration
 
-- `move`: speed 1-100%, signed duration up to 120 seconds; positive is forward.
-- `turn`: speed 1-100%, signed angle up to 3600 degrees; positive is left.
-- `spin`: speed 1-100%, signed duration up to 120 seconds; positive is left.
+- `move`: speed 1-100%, signed duration up to 60 seconds; positive is forward.
+- `turn`: fixed 50% speed, signed duration up to 60 seconds; positive is left.
+- The internal `spin` primitive remains available to persistent camera missions.
+- A general LLM turn can use at most four motion calls; inspections do not consume that count.
 - A target mission can use up to 240 short actions or 20 minutes.
 
 The sensor/obstacle refusal path is absent. The finite task containment, 750 ms MCU connection
@@ -155,8 +163,8 @@ watchdog, Web UI emergency stop, App Lab Stop button, and physical power removal
 they prevent a lost controller from leaving powered motors running.
 
 Linear distance estimation has been removed because there are no wheel encoders. A five-second
-move is now scheduled directly as 5000 ms on the MCU, independent of speed. Angular `turn`
-commands still use `DEG_PER_SEC_AT_100`; prefer `spin` when an exact rotation duration matters.
+move is scheduled directly as 5000 ms on the MCU, independent of speed. A user-facing `turn`
+is also duration-based and is translated to the existing MCU `spin_robot` RPC at fixed 50% speed.
 The physical channel map is Driver 1 A = front-left, Driver 1 B = rear-right,
 Driver 2 A = front-right, and Driver 2 B = rear-left. The corresponding tested polarities are
 front-left `-1`, front-right `+1`, rear-left `+1`, and rear-right `-1`.

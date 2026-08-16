@@ -133,28 +133,34 @@ class MotionValidationTests(unittest.TestCase):
             parse_api_keys(" , ")
 
     def test_signed_move_and_turn(self):
-        move = validate_motion("move", {"speed": 30, "seconds": -8})
-        turn = validate_motion("turn", {"speed": 45, "angle": 90})
+        move = validate_motion("move", {"speed": 30, "duration_seconds": -8})
+        turn = validate_motion("turn", {"duration_seconds": 0.5})
         self.assertEqual(move, MotionCall("move", 30, -8.0))
-        self.assertEqual(turn, MotionCall("turn", 45, 90.0))
+        self.assertEqual(turn, MotionCall("turn", 50, 0.5))
         self.assertIn("backward for 8 seconds", announcement(move))
-        self.assertIn("left 90 degrees", announcement(turn))
+        self.assertIn("left for 0.5 seconds", announcement(turn))
 
-    def test_omitted_speed_defaults_to_twenty_percent(self):
-        self.assertEqual(validate_motion("move", {"seconds": 5}), MotionCall("move", 20, 5.0))
+    def test_move_requires_speed_and_turn_uses_fixed_fifty_percent(self):
+        with self.assertRaises(ValueError):
+            validate_motion("move", {"duration_seconds": 5})
+        self.assertEqual(
+            validate_motion("turn", {"duration_seconds": -2}),
+            MotionCall("turn", 50, -2.0),
+        )
 
     def test_invalid_motion_values(self):
         invalid = [
-            ("move", {"speed": 0, "seconds": 1}),
-            ("move", {"speed": True, "seconds": 1}),
-            ("move", {"speed": 10, "seconds": 0}),
-            ("move", {"speed": 10, "seconds": 121}),
-            ("turn", {"speed": 10, "angle": -3601}),
+            ("move", {"speed": 0, "duration_seconds": 1}),
+            ("move", {"speed": True, "duration_seconds": 1}),
+            ("move", {"speed": 10, "duration_seconds": 0}),
+            ("move", {"speed": 10, "duration_seconds": 61}),
+            ("turn", {"duration_seconds": -61}),
             ("spin", {"speed": 10, "seconds": 121}),
-            ("move", {"speed": 101, "seconds": 1}),
-            ("turn", {"speed": 10, "angle": math.inf}),
-            ("dance", {"speed": 10, "angle": 1}),
-            ("turn", {"speed": 10, "angle": 1, "extra": 2}),
+            ("move", {"speed": 101, "duration_seconds": 1}),
+            ("turn", {"duration_seconds": math.inf}),
+            ("dance", {"duration_seconds": 1}),
+            ("turn", {"speed": 10, "duration_seconds": 1}),
+            ("turn", {"duration_seconds": 1, "extra": 2}),
         ]
         for name, arguments in invalid:
             with self.subTest(name=name, arguments=arguments):
@@ -186,14 +192,15 @@ class MotionValidationTests(unittest.TestCase):
             parse_direct_motion("move forward for five seconds at twenty percent"),
             MotionCall("move", 20, 5.0),
         )
-        self.assertEqual(parse_direct_motion("turn left"), MotionCall("turn", 20, 45.0))
         self.assertEqual(
             parse_direct_motion("rotate right for 10 seconds at 40%"),
-            MotionCall("spin", 40, -10.0),
+            MotionCall("turn", 50, -10.0),
         )
         self.assertIsNone(parse_direct_motion("what do you see in front of you?"))
         with self.assertRaisesRegex(ValueError, "distance commands are disabled"):
             parse_direct_motion("move forward by 50 centimeters")
+        with self.assertRaisesRegex(ValueError, "turn duration"):
+            parse_direct_motion("turn left")
 
     def test_target_mission_parser(self):
         self.assertEqual(
@@ -215,6 +222,7 @@ class AgentLoopTests(unittest.TestCase):
     def test_physical_mode_prompt_forbids_camera_motion_estimates(self):
         agent, _ = self.make_agent([])
         agent.physical_motion = True
+        self.assertIn("You are WALL-E", agent.system_prompt)
         self.assertIn("control real motors", agent.system_prompt)
         self.assertIn("Never claim exact physical distance or angle", agent.system_prompt)
         self.assertNotIn("This is a terminal simulator", agent.system_prompt)
@@ -255,6 +263,18 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(camera.calls, 0)
         self.assertEqual(len(client.completions.calls), 1)
 
+    def test_qwen_llm_uses_supported_reasoning_effort(self):
+        agent, client = self.make_agent([response(content="Hello!")])
+        agent.llm_model = "qwen/qwen3.6-27b"
+        self.assertEqual(agent.run_turn("Hello", lambda _: None).reply, "Hello!")
+        self.assertEqual(client.completions.calls[0]["reasoning_effort"], "default")
+
+    def test_cerebras_glm_disables_reasoning_with_supported_value(self):
+        agent, client = self.make_agent([response(content="Hello!")])
+        agent.llm_model = "zai-glm-4.7"
+        self.assertEqual(agent.run_turn("Hello", lambda _: None).reply, "Hello!")
+        self.assertEqual(client.completions.calls[0]["reasoning_effort"], "none")
+
     def test_target_locator_parses_strict_geometry_without_safety_advice(self):
         agent, client = self.make_agent(
             [
@@ -286,6 +306,26 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(agent._client_index, 2)
         self.assertEqual(agent.run_turn("Second", lambda _: None).reply, "Back on key one.")
         self.assertEqual(agent._client_index, 0)
+
+    def test_cerebras_llm_keys_rotate_and_wrap(self):
+        groq = FakeClient([])
+        first = FakeClient([FakeRateLimitError(), response(content="Back on key one.")])
+        second = FakeClient([response(content="Key two works."), FakeRateLimitError()])
+        agent = GroqRobot(
+            "unused",
+            client=groq,
+            cerebras_client=first,
+            camera=FakeCamera(),
+        )
+        agent._cerebras_clients = [first, second]
+        agent._cerebras_rate_limit_error = FakeRateLimitError
+
+        self.assertEqual(agent.llm_model, "gpt-oss-120b")
+        self.assertEqual(agent.run_turn("First", lambda _: None).reply, "Key two works.")
+        self.assertEqual(agent._cerebras_client_index, 1)
+        self.assertEqual(agent.run_turn("Second", lambda _: None).reply, "Back on key one.")
+        self.assertEqual(agent._cerebras_client_index, 0)
+        self.assertEqual(groq.completions.calls, [])
 
     def test_fully_rate_limited_pool_stops_after_one_cycle(self):
         clients = [FakeClient([FakeRateLimitError()]) for _ in range(3)]
@@ -323,7 +363,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(len(result["observation"].removesuffix("…").split()), 100)
 
     def test_tool_executes_before_final_response(self):
-        call = tool_call("one", "move", {"speed": 25, "seconds": 4})
+        call = tool_call("one", "move", {"speed": 25, "duration_seconds": 4})
         agent, client = self.make_agent(
             [response(tool_calls=[call]), response(content="Movement simulated.")]
         )
@@ -354,7 +394,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(outcome.reply, "Please try that again.")
 
     def test_fresh_inspection_is_required_between_motions(self):
-        calls = [tool_call(str(i), "turn", {"speed": 20, "angle": 10}) for i in range(2)]
+        calls = [tool_call(str(i), "turn", {"duration_seconds": 0.5}) for i in range(2)]
         agent, client = self.make_agent(
             [*(response(tool_calls=[call]) for call in calls), response(content="Inspection required.")]
         )
@@ -369,7 +409,7 @@ class AgentLoopTests(unittest.TestCase):
         self.assertIn("fresh camera inspection required", tool_result)
 
     def test_interruption_cancels_turn_without_second_request(self):
-        call = tool_call("one", "move", {"speed": 25, "seconds": 4})
+        call = tool_call("one", "move", {"speed": 25, "duration_seconds": 4})
         agent, client = self.make_agent([response(tool_calls=[call])])
         outcome = agent.run_turn(
             "Move",
@@ -411,7 +451,10 @@ class AgentLoopTests(unittest.TestCase):
     def test_inspection_does_not_consume_motion_limit(self):
         inspect1 = tool_call("vision1", "inspect_scene", {"question": "Is the path clear?"})
         inspect2 = tool_call("vision2", "inspect_scene", {"question": "Is it still clear?"})
-        motions = [tool_call(str(i), "move", {"speed": 20, "seconds": 1}) for i in range(2)]
+        motions = [
+            tool_call(str(i), "move", {"speed": 20, "duration_seconds": 1})
+            for i in range(2)
+        ]
         agent, client = self.make_agent(
             [
                 response(tool_calls=[inspect1]),
@@ -489,7 +532,7 @@ class AgentLoopTests(unittest.TestCase):
 
     def test_parallel_tool_batch_executes_nothing(self):
         inspect = tool_call("vision", "inspect_scene", {"question": "Is the path clear?"})
-        move = tool_call("move", "move", {"speed": 20, "seconds": 3})
+        move = tool_call("move", "move", {"speed": 20, "duration_seconds": 3})
         camera = FakeCamera(value="data:image/jpeg;base64,anBlZw==")
         agent, _ = self.make_agent(
             [response(tool_calls=[inspect, move]), response(content="I'll wait.")],

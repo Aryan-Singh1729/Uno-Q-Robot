@@ -4,6 +4,7 @@ from collections import deque
 import numpy as np
 
 from audio_io import (
+    END_SILENCE_FRAMES,
     UtteranceDetector,
     VoiceIO,
     amplify_pcm,
@@ -22,7 +23,7 @@ class UtteranceDetectorTests(unittest.TestCase):
             self.assertFalse(started)
             self.assertIsNone(audio)
 
-    def test_preroll_and_low_latency_silence_are_retained(self):
+    def test_preroll_and_endpoint_silence_are_retained(self):
         detector = UtteranceDetector()
         started_count = 0
         completed = None
@@ -32,25 +33,25 @@ class UtteranceDetectorTests(unittest.TestCase):
             started, audio = detector.push(b"v", True)
             started_count += started
             completed = audio if audio is not None else completed
-        for _ in range(30):
+        for _ in range(END_SILENCE_FRAMES):
             _, audio = detector.push(b"s", False)
             completed = audio if audio is not None else completed
         self.assertEqual(started_count, 1)
         self.assertIsNotNone(completed)
         self.assertTrue(completed.startswith(b"p"))
-        self.assertTrue(completed.endswith(b"s" * 30))
+        self.assertTrue(completed.endswith(b"s" * END_SILENCE_FRAMES))
 
     def test_pause_shorter_than_threshold_does_not_finish(self):
         detector = UtteranceDetector()
         for _ in range(10):
             detector.push(b"v", True)
-        for _ in range(29):
+        for _ in range(END_SILENCE_FRAMES - 1):
             _, audio = detector.push(b"s", False)
             self.assertIsNone(audio)
         for _ in range(3):
             detector.push(b"v", True)
         completed = None
-        for _ in range(30):
+        for _ in range(END_SILENCE_FRAMES):
             _, audio = detector.push(b"s", False)
             if audio is not None:
                 completed = audio
@@ -61,20 +62,20 @@ class UtteranceDetectorTests(unittest.TestCase):
         for _ in range(10):
             detector.push(b"v", True)
         completed = None
-        for index in range(30):
-            _, audio = detector.push(b"n", index in {8, 17, 26})
+        for index in range(END_SILENCE_FRAMES):
+            _, audio = detector.push(b"n", index in {10, 20, 30})
             if audio is not None:
                 completed = audio
         self.assertTrue(completed)
 
     def test_short_false_trigger_is_discarded(self):
         detector = UtteranceDetector()
-        for _ in range(5):
+        for _ in range(6):
             detector.push(b"v", True)
         completed = None
-        # Three initial silent frames complete the 8-frame start window, then
-        # 30 more are required for the configured 900 ms endpoint.
-        for _ in range(33):
+        # Four silent frames complete the 10-frame start window, followed by
+        # the configured endpoint silence.
+        for _ in range(4 + END_SILENCE_FRAMES):
             _, audio = detector.push(b"s", False)
             if audio is not None:
                 completed = audio
@@ -176,7 +177,7 @@ class UtteranceDetectorTests(unittest.TestCase):
         converted = voice._capture_callback(source)
         self.assertEqual(len(converted), 480 * 2)
 
-    def test_pcm_response_is_buffered_for_continuous_playback(self):
+    def test_pcm_response_is_played_as_chunks_arrive(self):
         writes = []
 
         class Output:
@@ -214,16 +215,44 @@ class UtteranceDetectorTests(unittest.TestCase):
         voice.output_device = None
         voice.playback_gain = 1.4
         voice.play(Stream())
-        self.assertEqual(len(writes), 1)
-        self.assertEqual(np.frombuffer(writes[0], dtype=np.int16).tolist(), [1, 3])
+        self.assertEqual(len(writes), 2)
+        self.assertEqual(
+            [np.frombuffer(item, dtype=np.int16).tolist() for item in writes],
+            [[1], [3]],
+        )
 
     def test_incomplete_pcm_response_is_rejected_before_playback(self):
+        class Output:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def write(self, _pcm):
+                return None
+
+        class SoundDevice:
+            class PortAudioError(Exception):
+                pass
+
+            @staticmethod
+            def check_output_settings(**_kwargs):
+                pass
+
+            @staticmethod
+            def RawOutputStream(**_kwargs):
+                return Output()
+
         class Stream:
             def read(self, _size):
                 value, self.value = getattr(self, "value", b"\x01"), b""
                 return value
 
         voice = VoiceIO.__new__(VoiceIO)
+        voice.sd = SoundDevice
+        voice.output_device = None
+        voice.playback_gain = 1.0
         with self.assertRaisesRegex(RuntimeError, "incomplete PCM"):
             voice.play(Stream())
 

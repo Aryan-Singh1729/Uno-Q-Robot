@@ -1,3 +1,4 @@
+cerebras-cloud-sdk
 groq
 numpy
 python-dotenv

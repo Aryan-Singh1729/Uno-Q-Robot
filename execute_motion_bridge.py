@@ -94,15 +94,17 @@ def execute_motion(
 ) -> str:
     """Start a validated MCU motion and poll its real completion state."""
     if stop_event is not None and stop_event.is_set():
-        return json.dumps({"status": "cancelled", "reason": "user speech detected"})
+        return json.dumps({"status": "cancelled", "reason": "explicit stop requested"})
     method = {
         "move": "move_robot",
-        "turn": "turn_robot",
+        # The public turn tool is duration-based; reuse the MCU's timed spin RPC.
+        "turn": "spin_robot",
         "spin": "spin_robot",
     }[call.name]
+    speed = 50 if call.name == "turn" else call.speed
     try:
         started = _decode_response(
-            Bridge.call(method, call.speed, call.amount),
+            Bridge.call(method, speed, call.amount),
             method,
         )
     except Exception as exc:
@@ -129,9 +131,9 @@ def execute_motion(
 
     while time.monotonic() < deadline:
         if stop_event is not None and stop_event.is_set():
-            _emergency_stop("user_speech")
+            _emergency_stop("explicit_stop")
             return json.dumps(
-                {"status": "cancelled", "reason": "user speech detected", **call.arguments()}
+                {"status": "cancelled", "reason": "explicit stop requested", **call.arguments()}
             )
         try:
             status = _decode_response(Bridge.call("robot_status"), "robot_status")

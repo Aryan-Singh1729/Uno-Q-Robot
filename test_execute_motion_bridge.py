@@ -68,7 +68,7 @@ class BridgeMotionTests(unittest.TestCase):
         )
         result = json.loads(self.backend.execute_motion(MotionCall("move", 30, 2)))
         self.assertEqual(result["status"], "completed")
-        self.assertEqual(result["seconds"], 2)
+        self.assertEqual(result["duration_seconds"], 2)
 
     def test_obstacle_start_is_not_reported_as_completed(self):
         FakeBridge.reset(
@@ -91,7 +91,7 @@ class BridgeMotionTests(unittest.TestCase):
     def test_motion_id_mismatch_issues_emergency_stop(self):
         FakeBridge.reset(
             {
-                "turn_robot": [json.dumps({"motion_id": 3, "status": "running", "duration_ms": 50})],
+                "spin_robot": [json.dumps({"motion_id": 3, "status": "running", "duration_ms": 50})],
                 "robot_status": [json.dumps({"motion_id": 4, "status": "running", "reason": ""})],
                 "stop_robot": ["{}"],
             }
@@ -99,6 +99,21 @@ class BridgeMotionTests(unittest.TestCase):
         result = json.loads(self.backend.execute_motion(MotionCall("turn", 40, -90)))
         self.assertEqual(result["status"], "error")
         self.assertIn(("stop_robot", ("motion_id_mismatch",)), FakeBridge.calls)
+
+    def test_public_timed_turn_uses_fixed_speed_spin_rpc(self):
+        FakeBridge.reset(
+            {
+                "spin_robot": [
+                    json.dumps({"motion_id": 6, "status": "running", "duration_ms": 10})
+                ],
+                "robot_status": [
+                    json.dumps({"motion_id": 6, "status": "completed", "reason": "duration reached"})
+                ],
+            }
+        )
+        result = json.loads(self.backend.execute_motion(MotionCall("turn", 12, -0.5)))
+        self.assertEqual(result["status"], "completed")
+        self.assertIn(("spin_robot", (50, -0.5)), FakeBridge.calls)
 
     def test_wait_for_mcu_requires_ready_flag(self):
         FakeBridge.reset(

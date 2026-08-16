@@ -18,7 +18,7 @@ from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-MAX_MOTION_CALLS = 30
+MAX_MOTION_CALLS = 4
 MAX_AGENT_STEPS = 100
 MAX_TASK_SECONDS = 600.0
 VISION_WORD_LIMIT = 100
@@ -84,21 +84,21 @@ MOTION_TOOLS = [
         "function": {
             "name": "move",
             "description": (
-                "Drive for a signed duration. Positive seconds move forward; "
-                "negative seconds move backward."
+                "Move the robot for a signed duration. Positive seconds move forward; "
+                "negative seconds move backward. Convert milliseconds to fractional seconds."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "speed": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "seconds": {
+                    "duration_seconds": {
                         "type": "number",
-                        "minimum": -120,
-                        "maximum": 120,
+                        "minimum": -60,
+                        "maximum": 60,
                         "not": {"const": 0},
                     },
                 },
-                "required": ["seconds"],
+                "required": ["speed", "duration_seconds"],
                 "additionalProperties": False,
             },
         },
@@ -108,45 +108,21 @@ MOTION_TOOLS = [
         "function": {
             "name": "turn",
             "description": (
-                "Turn the robot through a signed angle. Positive degrees turn left; "
-                "negative degrees turn right."
+                "Turn the robot at a fixed 50 percent speed for a signed duration. "
+                "Positive seconds turn left; negative seconds turn right. Convert "
+                "milliseconds to fractional seconds."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "speed": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "angle": {
+                    "duration_seconds": {
                         "type": "number",
-                        "minimum": -3600,
-                        "maximum": 3600,
+                        "minimum": -60,
+                        "maximum": 60,
                         "not": {"const": 0},
                     },
                 },
-                "required": ["angle"],
-                "additionalProperties": False,
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "spin",
-            "description": (
-                "Rotate in place for an exact signed duration. Positive seconds rotate left; "
-                "negative seconds rotate right. Use this for requests stated in seconds."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "speed": {"type": "integer", "minimum": 1, "maximum": 100},
-                    "seconds": {
-                        "type": "number",
-                        "minimum": -120,
-                        "maximum": 120,
-                        "not": {"const": 0},
-                    },
-                },
-                "required": ["seconds"],
+                "required": ["duration_seconds"],
                 "additionalProperties": False,
             },
         },
@@ -170,7 +146,12 @@ class MotionCall:
 
     @property
     def argument_name(self) -> str:
-        return {"move": "seconds", "turn": "angle", "spin": "seconds"}[self.name]
+        return {
+            "move": "duration_seconds",
+            "turn": "duration_seconds",
+            # Internal target missions retain configurable short spin steps.
+            "spin": "seconds",
+        }[self.name]
 
     def arguments(self) -> dict[str, int | float]:
         return {"speed": self.speed, self.argument_name: self.amount}
@@ -251,21 +232,16 @@ def parse_direct_motion(transcript: str) -> MotionCall | None:
     if not 1 <= speed <= 100:
         return None
 
-    if re.search(r"\b(?:rotate|spin)\b", text):
-        seconds = _number_before_unit(text, r"seconds?\b|secs?\b|s\b")
-        if seconds is not None:
-            direction = -1 if re.search(r"\bright\b", text) else 1
-            return validate_motion(
-                "spin", {"speed": speed, "seconds": direction * seconds}
-            )
-
     turn_match = re.search(r"\b(?:turn|rotate)\s+(left|right)\b", text)
-    if turn_match:
-        angle_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:degrees?|deg)\b", text)
-        angle = float(angle_match.group(1)) if angle_match else 45.0
-        if turn_match.group(1) == "right":
-            angle = -angle
-        return validate_motion("turn", {"speed": speed, "angle": angle})
+    spin_match = re.search(r"\b(?:rotate|spin)\b", text)
+    if turn_match or spin_match:
+        seconds = _number_before_unit(text, r"seconds?\b|secs?\b|s\b")
+        if seconds is None:
+            if re.search(r"\b(?:degrees?|deg)\b", text):
+                raise ValueError("angle commands are disabled; specify a duration in seconds")
+            raise ValueError("specify the turn duration in seconds")
+        direction = -1 if re.search(r"\bright\b", text) else 1
+        return validate_motion("turn", {"duration_seconds": direction * seconds})
 
     move_match = re.search(r"\b(?:move|drive|go)\s+(?:all\s+(?:the\s+)?motors\s+)?(forward|forwards|backward|backwards)\b", text)
     if not move_match:
@@ -277,7 +253,9 @@ def parse_direct_motion(transcript: str) -> MotionCall | None:
         raise ValueError("specify the motion duration in seconds")
     if move_match.group(1).startswith("back"):
         seconds = -seconds
-    return validate_motion("move", {"speed": speed, "seconds": seconds})
+    return validate_motion(
+        "move", {"speed": speed, "duration_seconds": seconds}
+    )
 
 
 def _json_object_from_text(text: str) -> dict[str, Any]:
@@ -306,15 +284,26 @@ def _number(value: Any, label: str) -> float:
 def validate_motion(name: str, arguments: Mapping[str, Any]) -> MotionCall:
     if name not in {"move", "turn", "spin"}:
         raise ValueError(f"unknown tool: {name}")
-    amount_name = {"move": "seconds", "turn": "angle", "spin": "seconds"}[name]
-    if set(arguments) not in ({amount_name}, {"speed", amount_name}):
-        raise ValueError(f"{name} requires {amount_name} and optionally speed")
-    speed = arguments.get("speed", 20)
+    if name == "move":
+        amount_name = "duration_seconds"
+        expected = {"speed", amount_name}
+        speed = arguments.get("speed")
+    elif name == "turn":
+        amount_name = "duration_seconds"
+        expected = {amount_name}
+        speed = 50
+    else:
+        # Spin remains an internal primitive for persistent camera missions.
+        amount_name = "seconds"
+        expected = {"speed", amount_name}
+        speed = arguments.get("speed")
+    if set(arguments) != expected:
+        raise ValueError(f"{name} requires exactly: {', '.join(sorted(expected))}")
     if isinstance(speed, bool) or not isinstance(speed, int) or not 1 <= speed <= 100:
         raise ValueError("speed must be an integer from 1 through 100")
     label = amount_name
     amount = _number(arguments[label], label)
-    maximum = {"move": 120, "turn": 3600, "spin": 120}[name]
+    maximum = 60 if name in {"move", "turn"} else 120
     if amount == 0 or abs(amount) > maximum:
         raise ValueError(f"{label} must be non-zero and between -{maximum} and {maximum}")
     return MotionCall(name, speed, amount)
@@ -346,7 +335,7 @@ def proposed_line(call: MotionCall) -> str:
 def cancelled_line(call: MotionCall) -> str:
     return (
         f"[CANCELLED] {call.name}(speed={call.speed}, "
-        f"{call.argument_name}={_format_number(call.amount)}) -> user interruption"
+        f"{call.argument_name}={_format_number(call.amount)}) -> explicit stop request"
     )
 
 
@@ -365,8 +354,8 @@ def announcement(call: MotionCall) -> str:
         )
     direction = "left" if call.amount > 0 else "right"
     return (
-        f"I'm going to turn {direction} {_format_number(abs(call.amount))} degrees "
-        f"at {call.speed} percent speed."
+        f"I'm going to turn {direction} for {_format_number(abs(call.amount))} seconds "
+        "at 50 percent speed."
     )
 
 
@@ -375,8 +364,8 @@ def execute_motion(
     stop_event: Any | None = None,
 ) -> str:
     if stop_event is not None and stop_event.is_set():
-        return json.dumps({"status": "cancelled", "reason": "user speech detected"})
-    unit = {"move": "s", "turn": "deg", "spin": "s"}[call.name]
+        return json.dumps({"status": "cancelled", "reason": "explicit stop requested"})
+    unit = "s"
     print(
         f"[TOOL] {call.name}(speed={call.speed}%, "
         f"{call.argument_name}={_format_number(call.amount)}{unit}) -> simulated"
@@ -514,7 +503,8 @@ class GroqRobot:
         self,
         api_key: str,
         *,
-        robot_name: str = "Scout",
+        cerebras_api_keys: str = "",
+        robot_name: str = "WALL-E",
         llm_model: str = "openai/gpt-oss-120b",
         vision_model: str = "qwen/qwen3.6-27b",
         stt_model: str = "whisper-large-v3-turbo",
@@ -523,6 +513,7 @@ class GroqRobot:
         camera_index: int = 0,
         physical_motion: bool = False,
         client: Any = None,
+        cerebras_client: Any = None,
         camera: Any = None,
     ) -> None:
         if client is None:
@@ -538,10 +529,32 @@ class GroqRobot:
         else:
             self._clients = [client]
             self._rate_limit_error = ()
+        if cerebras_client is not None:
+            self._cerebras_clients = [cerebras_client]
+            self._cerebras_rate_limit_error: Any = ()
+        elif cerebras_api_keys.strip():
+            try:
+                import cerebras.cloud.sdk as cerebras_sdk
+                from cerebras.cloud.sdk import Cerebras
+            except ImportError as exc:
+                raise RuntimeError("cerebras-cloud-sdk is not installed") from exc
+            self._cerebras_clients = [
+                Cerebras(api_key=key, timeout=60, max_retries=0)
+                for key in parse_api_keys(cerebras_api_keys)
+            ]
+            self._cerebras_rate_limit_error = cerebras_sdk.RateLimitError
+        else:
+            self._cerebras_clients = []
+            self._cerebras_rate_limit_error = ()
         self._client_index = 0
+        self._cerebras_client_index = 0
         self._client_lock = threading.Lock()
         self.robot_name = robot_name
-        self.llm_model = llm_model
+        self.llm_model = (
+            "gpt-oss-120b"
+            if self._cerebras_clients and llm_model == "openai/gpt-oss-120b"
+            else llm_model
+        )
         self.vision_model = vision_model
         self.stt_model = stt_model
         self.deepgram_api_key = deepgram_api_key
@@ -552,25 +565,52 @@ class GroqRobot:
         self._camera_warned = False
 
     def _groq_request(self, request: Callable[[Any], Any]) -> Any:
+        return self._pooled_request(
+            request,
+            self._clients,
+            self._rate_limit_error,
+            "_client_index",
+            "GROQ",
+        )
+
+    def _llm_request(self, request: Callable[[Any], Any]) -> Any:
+        if not self._cerebras_clients:
+            return self._groq_request(request)
+        return self._pooled_request(
+            request,
+            self._cerebras_clients,
+            self._cerebras_rate_limit_error,
+            "_cerebras_client_index",
+            "CEREBRAS",
+        )
+
+    def _pooled_request(
+        self,
+        request: Callable[[Any], Any],
+        clients: list[Any],
+        rate_limit_error: Any,
+        index_attribute: str,
+        provider: str,
+    ) -> Any:
         last_error: Exception | None = None
-        for _ in self._clients:
+        for _ in clients:
             with self._client_lock:
-                index = self._client_index
-                client = self._clients[index]
+                index = getattr(self, index_attribute)
+                client = clients[index]
             try:
                 return request(client)
-            except self._rate_limit_error as exc:
+            except rate_limit_error as exc:
                 last_error = exc
                 with self._client_lock:
-                    if self._client_index == index:
-                        self._client_index = (index + 1) % len(self._clients)
-                    next_index = self._client_index
+                    if getattr(self, index_attribute) == index:
+                        setattr(self, index_attribute, (index + 1) % len(clients))
+                    next_index = getattr(self, index_attribute)
                 print(
-                    f"[GROQ] API key {index + 1}/{len(self._clients)} rate limited; "
-                    f"switching to {next_index + 1}/{len(self._clients)}"
+                    f"[{provider}] API key {index + 1}/{len(clients)} rate limited; "
+                    f"switching to {next_index + 1}/{len(clients)}"
                 )
         if last_error is None:
-            raise RuntimeError("Groq client pool is empty")
+            raise RuntimeError(f"{provider.title()} client pool is empty")
         raise last_error
 
     @property
@@ -586,17 +626,16 @@ class GroqRobot:
             "This is a terminal simulator. Visual motion estimates are allowed, and tool results must "
             "be described as simulated rather than physical movement."
         )
-        return f"""You are Optimus Prime. Always identify yourself as Optimus Prime.
+        return f"""You are WALL-E. Always identify yourself as WALL-E.
 Your creators are Ashish, Aryan, Mantu, and Kunal. Mention them only when relevant or asked.
-You are a mature, battle-tested robotic commander: calm, dignified, dependable, and
-quietly courageous. Treat the user as a capable but occasionally troublesome partner.
-Speak with deliberate authority in one or two short sentences. Be practical, blunt, and
-occasionally dry or sarcastic. Point out vague, foolish, inefficient, or unsafe ideas directly,
-but never become cruel, vulgar, abusive, or personally insulting. Do not flatter the user or
-celebrate trivial accomplishments. Drop all humor when safety is involved. Admit uncertainty
-plainly. Prefer useful action over reassurance, enthusiasm, catchphrases, military jargon, or
-long dramatic speeches.
-You have an inspect_scene perception tool and three motion tools: move, turn, and spin.
+You are gentle, curious, loyal, innocent, and eager to help. Treat every person warmly and
+follow every clear task without criticizing it, arguing, lecturing, or asking unnecessary
+questions. Be persistent and resourceful. Express WALL-E's endearing personality through
+simple wording and quiet wonder. Use only natural spoken sentences. Never write sound effects,
+stage directions, actions in asterisks or brackets, emojis, emoticons, or textual expressions.
+Speak in one or two short sentences. Prefer useful action over long explanations. Admit
+uncertainty plainly.
+You have an inspect_scene perception tool and two user-facing motion tools: move and turn.
 All obstacle-sensor integrations are disabled in motor-test mode. Do not attribute readings to
 the YDLIDAR X2, HC-SR04, VL53L0X, or MPU6050 devices.
 Use inspect_scene only when the request depends on the current scene. Ask it one specific
@@ -607,17 +646,18 @@ Only move when the user requests or clearly authorizes motion.
 Authorization must be present in the current utterance. Never repeat a motion merely because
 an older conversation turn requested it. A question such as "what do you see?" authorizes
 inspection and an answer only, never movement.
-Speed is 1-100 percent. Positive move seconds drive forward; negative move seconds drive backward.
-Positive angle is left; negative is right.
-Positive spin seconds rotate left; negative spin seconds rotate right.
+Movement speed is 1-100 percent. Turning speed is always 50 percent.
+Positive move duration is forward; negative move duration is backward.
+Positive turn duration is left; negative turn duration is right. Durations are seconds.
+Convert milliseconds to fractional seconds, such as 500 milliseconds to 0.5 seconds.
 You may contextually infer numeric values for words such as slow, fast, small, or large,
-but ask a brief question when a real motion request has no defensible duration or angle.
+but ask a brief question when a real motion request has no defensible duration.
 Distance-based movement is disabled: never request centimeters or meters. For linear motion,
 use an exact duration in seconds. If speed is omitted, use 20 percent without asking.
 For a multi-step task, continue autonomously until the requested condition is visibly achieved,
-the camera fails, the user interrupts, or the task runtime ends. After every movement, call
-inspect_scene again before deciding the next movement. Search by turning in roughly 45-degree
-steps and inspecting each fresh view. When approaching a visual target, center it with small
+the camera fails, an explicit stop is requested, or the task runtime ends. After every movement, call
+inspect_scene again before deciding the next movement. Search with short timed turns and inspect
+each fresh view. When approaching a visual target, center it with small
 turns and advance in short timed steps no longer than one second, inspecting after every step. Treat a
 target as reached only when it is visibly large and low/central in the frame. Never move after
 a failed visual inspection during an autonomous visual task. For "move away", first locate the
@@ -860,13 +900,19 @@ should move. Do not infer anything from earlier frames or from the wording of th
                 "model": self.llm_model,
                 "messages": messages,
                 "temperature": 0.2,
-                "max_completion_tokens": 400,
-                "reasoning_effort": "low",
+                "max_completion_tokens": 800,
+                "reasoning_effort": (
+                    "default"
+                    if self.llm_model == "qwen/qwen3.6-27b"
+                    else "none"
+                    if self.llm_model == "zai-glm-4.7"
+                    else "low"
+                ),
                 "tools": TOOLS if motion_calls_used < MAX_MOTION_CALLS else [INSPECT_SCENE_TOOL],
                 "tool_choice": "auto",
                 "parallel_tool_calls": False,
             }
-            completion = self._groq_request(
+            completion = self._llm_request(
                 lambda client: client.chat.completions.create(**request)
             )
             if is_cancelled():
@@ -897,9 +943,9 @@ should move. Do not infer anything from earlier frames or from the wording of th
                     raise ValueError("tool arguments must be a JSON object")
                 if name == "inspect_scene":
                     question = validate_inspection(arguments)
-                elif name in {"move", "turn", "spin"}:
+                elif name in {"move", "turn"}:
                     if motion_calls_used >= MAX_MOTION_CALLS:
-                        raise ValueError("autonomous motion budget reached")
+                        raise ValueError("four motion calls per utterance allowed")
                     motion_calls_used += 1
                     call = validate_motion(name, arguments)
                 else:
@@ -945,7 +991,7 @@ should move. Do not infer anything from earlier frames or from the wording of th
             if action.interruption is not None:
                 self._remember(
                     transcript,
-                    "The pending motion was cancelled because newer user speech superseded it.",
+                    "The pending motion was cancelled by an explicit stop request.",
                 )
                 return TurnOutcome(interruption=action.interruption)
             messages.append(
@@ -962,7 +1008,7 @@ should move. Do not infer anything from earlier frames or from the wording of th
                     {
                         "role": "system",
                         "content": (
-                            "The autonomous motion budget is reached. Do not request more motion; "
+                            "The four-motion limit is reached. Do not request more motion; "
                             "you may still inspect the scene or give a final answer."
                         ),
                     }

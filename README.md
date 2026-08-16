@@ -1,4 +1,4 @@
-# WALL-E UNO Q timed-motion voice robot - v15.1
+# WALL-E UNO Q timed-motion voice robot - v15.2
 
 This is one Arduino App Lab application containing both UNO Q processors:
 
@@ -97,13 +97,13 @@ HTTP 429. `openai/gpt-oss-120b` is translated to Cerebras model ID `gpt-oss-120b
 6. Confirm these messages appear:
 
 ```text
-[MCU] motor-map-v14.2 Bridge ready; physical wheel mapping corrected
+[MCU] motor-map-v15.2 Bridge ready; rear channel ownership corrected
 [MOTOR] UNO Q MCU bridge is ready
 [WEB] live camera view: http://arduinoq.local:7000
 [AUDIO] ... EMEET SmartCam ... -> selected
 ```
 
-The Python app requires the exact `motor-map-v14.2` MCU handshake. If App Lab leaves an older
+The Python app requires the exact `motor-map-v15.2` MCU handshake. If App Lab leaves an older
 sensor sketch flashed, startup fails explicitly instead of silently using stale firmware.
 
 For a direct test, keep the wheels raised and say:
@@ -168,14 +168,25 @@ they prevent a lost controller from leaving powered motors running.
 Linear distance estimation has been removed because there are no wheel encoders. A five-second
 move is scheduled directly as 5000 ms on the MCU, independent of speed. A user-facing `turn`
 is also duration-based and is translated to the existing MCU `spin_robot` RPC at fixed 50% speed.
-The physical channel map is Driver 1 A = front-left, Driver 1 B = rear-right,
-Driver 2 A = front-right, and Driver 2 B = rear-left. The corresponding tested polarities are
-front-left `-1`, front-right `+1`, rear-left `+1`, and rear-right `-1`.
+The physical channel map verified by the v15.1 wheel observations is Driver 1 A = front-left,
+Driver 1 B = rear-left, Driver 2 A = front-right, and Driver 2 B = rear-right. The corresponding
+polarities are front-left `-1`, rear-left `-1`, front-right `+1`, and rear-right `+1`. This rear
+ownership correction leaves the already-working forward/backward electrical outputs unchanged.
 
-If rear-left moves forward but remains still during backward and right-turn tests, inspect the
-`A2 -> BIN2` connection on Driver 2. Those three observations all use the same rear-left
-electrical state (`BIN1=LOW`, `BIN2=HIGH`), while its working direction proves PWM D9,
-`BIN1`, standby, motor power, and the motor itself can operate.
+The expected physical wheel directions are:
+
+| Command | Front left | Rear left | Front right | Rear right |
+| --- | --- | --- | --- | --- |
+| Forward | forward | forward | forward | forward |
+| Backward | backward | backward | backward | backward |
+| Left | backward | backward | forward | forward |
+| Right | forward | forward | backward | backward |
+
+For a right turn, rear-right is now Driver 2 channel B (`D9` PWM, `A1` BIN1, `A2` BIN2) and
+receives the same reverse electrical state that already works during a whole-robot backward
+command. If that wheel still stops only during a right turn at the same requested speed after
+v15.2 is confirmed in the MCU log, inspect the Driver 2 B wiring/terminal for an intermittent
+connection rather than changing its polarity again.
 
 ## Tests
 

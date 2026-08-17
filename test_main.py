@@ -30,12 +30,14 @@ class AppPackagingTests(unittest.TestCase):
             "setMotor(D2_AIN1, D2_AIN2, D2_PWMA, right * FRONT_RIGHT_POLARITY, pwm);",
             "setMotor(D2_BIN1, D2_BIN2, D2_PWMB, right * REAR_RIGHT_POLARITY, pwm);",
             "const int correctedDirection = -direction;",
-            '\\"firmware_version\\":\\"motor-map-v15.4\\"',
+            '\\"firmware_version\\":\\"lidar-guard-v16.0\\"',
             '\\"motor_map\\":\\"D1A=front_left,D1B=rear_left,D2A=front_right,D2B=rear_right\\"',
+            '\\"lidar_guard_source\\":\\"linux_usb\\"',
         )
         for line in expected_lines:
             with self.subTest(line=line):
                 self.assertIn(line, sketch)
+        self.assertNotIn("Serial1.begin", sketch)
 
     def test_motor_map_produces_required_four_command_truth_table(self):
         # Physical forward is +1 and physical backward is -1. The final floor

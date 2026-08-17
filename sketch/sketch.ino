@@ -1,9 +1,9 @@
 /*
- * UNO Q robot - motor-only App Lab test sketch
+ * UNO Q robot - timed motor control with Linux-side YDLIDAR X2 guarding
  *
- * Sensor integration is intentionally disabled in this build. The Linux
- * Python app calls these functions through Arduino_RouterBridge. Keep the
- * robot on a clear test surface and begin with short commands.
+ * Linux reads the X2 through its USB-to-UART adapter and calls stop_robot
+ * through Arduino_RouterBridge. Serial1/D0-D1 must remain reserved for the
+ * UNO Q router. Other distance sensors and the IMU remain disabled.
  */
 
 #include <Arduino_RouterBridge.h>
@@ -139,10 +139,12 @@ static String statusJson() {
   json += "\"motion_id\":" + String(motionId) + ",";
   json += "\"status\":\"" + jsonEscape(motionStatus) + "\",";
   json += "\"reason\":\"" + jsonEscape(motionReason) + "\",";
-  json += "\"firmware_version\":\"motor-map-v15.4\",";
+  json += "\"firmware_version\":\"lidar-guard-v16.0\",";
   json += "\"motor_map\":\"D1A=front_left,D1B=rear_left,D2A=front_right,D2B=rear_right\",";
-  json += "\"motor_test_mode\":true,";
-  json += "\"sensor_guard_enabled\":false";
+  json += "\"motor_test_mode\":false,";
+  json += "\"sensor_guard_enabled\":true,";
+  json += "\"lidar_guard_source\":\"linux_usb\",";
+  json += "\"lidar_stop_distance_mm\":100";
   json += "}";
   return json;
 }
@@ -194,8 +196,9 @@ static String startMotion(int speed, float amount, bool turning) {
   json += "\"motion_id\":" + String(motionId) + ",";
   json += "\"status\":\"running\",";
   json += "\"duration_ms\":" + String(durationMs) + ",";
-  json += "\"motor_test_mode\":true,";
-  json += "\"sensor_guard_enabled\":false";
+  json += "\"motor_test_mode\":false,";
+  json += "\"sensor_guard_enabled\":true,";
+  json += "\"lidar_stop_distance_mm\":100";
   json += "}";
   return json;
 }
@@ -236,8 +239,9 @@ String spin_robot(int speed, float seconds) {
   json += "\"motion_id\":" + String(motionId) + ",";
   json += "\"status\":\"running\",";
   json += "\"duration_ms\":" + String(durationMs) + ",";
-  json += "\"motor_test_mode\":true,";
-  json += "\"sensor_guard_enabled\":false";
+  json += "\"motor_test_mode\":false,";
+  json += "\"sensor_guard_enabled\":true,";
+  json += "\"lidar_stop_distance_mm\":100";
   json += "}";
   return json;
 }
@@ -253,7 +257,7 @@ String robot_status() {
 }
 
 String read_sensors() {
-  return "{\"status\":\"disabled\",\"reason\":\"motor-only test mode\"}";
+  return "{\"status\":\"disabled\",\"reason\":\"non-LiDAR sensors are disabled in v16\"}";
 }
 
 void setup() {
@@ -282,8 +286,8 @@ void setup() {
   Bridge.provide_safe("robot_status", robot_status);
   Bridge.provide_safe("read_sensors", read_sensors);
   bridgeReady = true;
-  motionReason = "motor-map-v15.4 ready";
-  Serial.println("[MCU] motor-map-v15.4 Bridge ready; turn semantics corrected");
+  motionReason = "lidar-guard-v16.0 ready; Linux USB X2 guard required";
+  Serial.println("[MCU] lidar-guard-v16.0 Bridge ready; Serial1 reserved for RouterBridge");
 }
 
 void loop() {

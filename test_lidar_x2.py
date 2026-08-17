@@ -37,13 +37,25 @@ class YDLidarX2Tests(unittest.TestCase):
         self.assertEqual(YDLidarX2.decode_packet(bytes(packet)), [])
 
     def test_front_guard_uses_multiple_recent_points(self):
-        lidar = YDLidarX2(required=True, stop_distance_mm=300)
+        lidar = YDLidarX2(required=True, stop_distance_mm=100)
         lidar.serial = object()
         lidar.running = True
         now = time.monotonic()
         lidar.last_packet_at = now
-        lidar.points = {0: (220, now), 1: (240, now), 2: (260, now)}
-        self.assertEqual(lidar.guard_reason(), "YDLIDAR X2 obstacle at 24.0 cm")
+        lidar.points = {0: (95, now), 1: (240, now), 2: (260, now)}
+        self.assertEqual(lidar.guard_reason(), "YDLIDAR X2 emergency stop at 9.5 cm")
+
+    def test_stop_distance_cannot_expand_beyond_ten_centimetres(self):
+        self.assertEqual(YDLidarX2(stop_distance_mm=300).stop_distance_mm, 100)
+
+    def test_reading_just_over_ten_centimetres_does_not_stop(self):
+        lidar = YDLidarX2(required=True)
+        lidar.serial = object()
+        lidar.running = True
+        now = time.monotonic()
+        lidar.last_packet_at = now
+        lidar.points = {0: (100.4, now)}
+        self.assertIsNone(lidar.guard_reason())
 
     def test_required_lidar_fails_closed_without_fresh_scan(self):
         lidar = YDLidarX2(required=True)

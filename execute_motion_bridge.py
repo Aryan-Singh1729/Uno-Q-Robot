@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from arduino.app_utils import Bridge
@@ -13,6 +15,14 @@ POLL_INTERVAL_SECONDS = 0.05
 BRIDGE_READY_TIMEOUT_SECONDS = 20.0
 MOTION_TIMEOUT_GRACE_SECONDS = 2.0
 TERMINAL_STATES = {"completed", "cancelled", "obstacle", "error", "idle"}
+FIRMWARE_VERSION = "lidar-guard-v16.0"
+BRIDGE_LOCK = threading.Lock()
+
+
+def _bridge_call(method: str, *args: Any) -> Any:
+    """Serialize MCU RPCs shared by motion polling and the live LiDAR view."""
+    with BRIDGE_LOCK:
+        return Bridge.call(method, *args)
 
 
 def _sensor_summary(status: dict[str, Any]) -> str:
@@ -48,28 +58,19 @@ def wait_for_mcu(timeout: float = BRIDGE_READY_TIMEOUT_SECONDS) -> dict[str, Any
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         try:
-            status = _decode_response(Bridge.call("robot_status"), "robot_status")
+            status = _decode_response(_bridge_call("robot_status"), "robot_status")
             if status.get("ready") is True:
-                if status.get("firmware_version") != "motor-map-v15.4":
+                if status.get("firmware_version") != FIRMWARE_VERSION:
                     last_error = RuntimeError(
-                        "stale MCU sketch detected; App Lab did not flash motor-map-v15.4"
+                        f"stale MCU sketch detected; App Lab did not flash {FIRMWARE_VERSION}"
                     )
                     time.sleep(0.25)
                     continue
                 print("[MOTOR] UNO Q MCU bridge is ready")
-                if status.get("motor_test_mode") is True:
-                    print("[MOTOR] MOTOR-ONLY TEST MODE: all sensor guards are disabled")
-                missing = [
-                    label
-                    for key, label in (
-                        ("tof_left_ready", "left ToF"),
-                        ("tof_right_ready", "right ToF"),
-                        ("mpu_ready", "MPU6050"),
-                    )
-                    if status.get(key) is False
-                ]
-                if missing:
-                    print(f"[SENSOR] unavailable at startup: {', '.join(missing)}")
+                print(
+                    "[LIDAR] Linux USB emergency guard configured at "
+                    f"{status.get('lidar_stop_distance_mm', 100) / 10:.1f} cm"
+                )
                 return status
             last_error = RuntimeError(f"MCU is not ready: {status}")
         except Exception as exc:
@@ -83,7 +84,7 @@ def wait_for_mcu(timeout: float = BRIDGE_READY_TIMEOUT_SECONDS) -> dict[str, Any
 
 def _emergency_stop(reason: str) -> None:
     try:
-        Bridge.call("stop_robot", reason)
+        _bridge_call("stop_robot", reason)
     except Exception as exc:
         print(f"[MOTOR] emergency stop RPC failed: {exc}")
 
@@ -91,10 +92,17 @@ def _emergency_stop(reason: str) -> None:
 def execute_motion(
     call: MotionCall,
     stop_event: Any | None = None,
+    lidar_guard: Callable[[], str | None] | None = None,
 ) -> str:
     """Start a validated MCU motion and poll its real completion state."""
     if stop_event is not None and stop_event.is_set():
         return json.dumps({"status": "cancelled", "reason": "explicit stop requested"})
+    if lidar_guard is not None:
+        reason = lidar_guard()
+        if reason:
+            _emergency_stop("lidar_preflight_stop")
+            print(f"[LIDAR] motion blocked: {reason}")
+            return json.dumps({"status": "obstacle", "reason": reason, **call.arguments()})
     method = {
         "move": "move_robot",
         # The public turn tool is duration-based; reuse the MCU's timed spin RPC.
@@ -104,7 +112,7 @@ def execute_motion(
     speed = 50 if call.name == "turn" else call.speed
     try:
         started = _decode_response(
-            Bridge.call(method, speed, call.amount),
+            _bridge_call(method, speed, call.amount),
             method,
         )
     except Exception as exc:
@@ -135,8 +143,14 @@ def execute_motion(
             return json.dumps(
                 {"status": "cancelled", "reason": "explicit stop requested", **call.arguments()}
             )
+        if lidar_guard is not None:
+            reason = lidar_guard()
+            if reason:
+                _emergency_stop("lidar_emergency_stop")
+                print(f"[LIDAR] emergency stop: {reason}")
+                return json.dumps({"status": "obstacle", "reason": reason, **call.arguments()})
         try:
-            status = _decode_response(Bridge.call("robot_status"), "robot_status")
+            status = _decode_response(_bridge_call("robot_status"), "robot_status")
         except Exception as exc:
             _emergency_stop("bridge_error")
             return json.dumps({"status": "error", "reason": f"status polling failed: {exc}"})
@@ -160,7 +174,7 @@ def execute_motion(
 
 def read_sensors() -> dict[str, Any]:
     try:
-        return _decode_response(Bridge.call("read_sensors"), "read_sensors")
+        return _decode_response(_bridge_call("read_sensors"), "read_sensors")
     except Exception as exc:
         print(f"[SENSOR] read_sensors failed: {exc}")
         return {"status": "error", "reason": str(exc)}

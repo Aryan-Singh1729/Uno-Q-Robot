@@ -124,9 +124,10 @@ class BridgeMotionTests(unittest.TestCase):
                             "ready": True,
                             "status": "idle",
                             "motion_id": 0,
-                            "firmware_version": "motor-map-v15.4",
-                            "motor_test_mode": True,
-                            "sensor_guard_enabled": False,
+                            "firmware_version": "lidar-guard-v16.0",
+                            "motor_test_mode": False,
+                            "sensor_guard_enabled": True,
+                            "lidar_stop_distance_mm": 100,
                         }
                     )
                 ]
@@ -134,6 +135,42 @@ class BridgeMotionTests(unittest.TestCase):
         )
         result = self.backend.wait_for_mcu(timeout=0.1)
         self.assertTrue(result["ready"])
+
+    def test_lidar_preflight_blocks_motion_and_brakes(self):
+        FakeBridge.reset(
+            {
+                "stop_robot": ["{}"],
+            }
+        )
+        result = json.loads(
+            self.backend.execute_motion(
+                MotionCall("move", 20, 1),
+                lidar_guard=lambda: "YDLIDAR X2 emergency stop at 9.5 cm",
+            )
+        )
+        self.assertEqual(result["status"], "obstacle")
+        self.assertIn(("stop_robot", ("lidar_preflight_stop",)), FakeBridge.calls)
+        self.assertFalse(any(method == "move_robot" for method, _args in FakeBridge.calls))
+
+    def test_lidar_guard_stops_active_motion_before_next_status_poll(self):
+        reasons = iter((None, "YDLIDAR X2 emergency stop at 10.0 cm"))
+        FakeBridge.reset(
+            {
+                "move_robot": [
+                    json.dumps({"motion_id": 9, "status": "running", "duration_ms": 5000})
+                ],
+                "stop_robot": ["{}"],
+            }
+        )
+        result = json.loads(
+            self.backend.execute_motion(
+                MotionCall("move", 20, 5),
+                lidar_guard=lambda: next(reasons),
+            )
+        )
+        self.assertEqual(result["status"], "obstacle")
+        self.assertIn(("stop_robot", ("lidar_emergency_stop",)), FakeBridge.calls)
+        self.assertFalse(any(method == "robot_status" for method, _args in FakeBridge.calls))
 
     def test_timed_spin_uses_dedicated_rpc(self):
         FakeBridge.reset(

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from audio_io import VoiceIO
+from lidar_x2 import YDLidarX2
 from live_view import LiveCameraView
 from robot_agent import (
     ActionResult,
@@ -33,7 +34,12 @@ except ImportError:
 
 
 try:
-    from execute_motion_bridge import execute_motion, read_sensors, stop_motors, wait_for_mcu
+    from execute_motion_bridge import (
+        execute_motion,
+        read_sensors,
+        stop_motors,
+        wait_for_mcu,
+    )
 
     HARDWARE_MOTION = True
     print("[BOOT] Arduino App Lab Bridge detected - physical motor mode")
@@ -96,6 +102,7 @@ class Settings:
     output_device: str | None = None
     playback_gain: float = 3.0
     camera_index: int = 0
+    lidar_port: str | None = None
 
 
 class RobotApp:
@@ -104,10 +111,12 @@ class RobotApp:
         agent: GroqRobot,
         audio: VoiceIO,
         live_view: LiveCameraView | None = None,
+        lidar: YDLidarX2 | None = None,
     ) -> None:
         self.agent = agent
         self.audio = audio
         self.live_view = live_view
+        self.lidar = lidar
         self.state: State | None = None
         self.running = True
         self.command_queue: queue.Queue[str] = queue.Queue()
@@ -130,6 +139,8 @@ class RobotApp:
                 self.live_view.publish_status(state.value)
 
     def run(self) -> None:
+        if self.lidar is not None:
+            self.lidar.start()
         if HARDWARE_MOTION:
             self.set_state(State.PROCESSING)
             wait_for_mcu()
@@ -423,7 +434,8 @@ class RobotApp:
                     "  /test-mic [SECONDS]  measure and transcribe the active mic\n"
                     "  /calibrate-mic       recalibrate the quiet-noise threshold\n"
                     "  /test-camera         capture one frame without sending it\n"
-                    "  /sensors             read MCU distance and IMU sensors\n"
+                    "  /lidar               show live X2 connection and front distance\n"
+                    "  /sensors             show LiDAR plus disabled sensor status\n"
                     "  /stop                immediately stop and brake all motors\n"
                     "  /quit                stop the app"
                 )
@@ -482,7 +494,9 @@ class RobotApp:
                 else:
                     print("[CONFIG] camera test failed")
             elif command == "/sensors":
-                print(f"[SENSOR] {json.dumps({'mcu': read_sensors()}, sort_keys=True)}")
+                print(f"[SENSOR] {json.dumps({'lidar': self._lidar_status(), 'mcu': read_sensors()}, sort_keys=True)}")
+            elif command == "/lidar":
+                print(f"[LIDAR] {json.dumps(self._lidar_status(), sort_keys=True)}")
             elif command == "/stop":
                 self.motion_stop.set()
                 stop_motors("console_stop")
@@ -500,6 +514,16 @@ class RobotApp:
         self.set_state(State.RECORDING)
         threshold = self.audio.calibrate_input()
         print(f"[AUDIO] speech RMS threshold: {threshold:.0f}")
+
+    def _lidar_status(self) -> dict[str, object]:
+        if self.lidar is None:
+            return {
+                "connected": False,
+                "scan_fresh": False,
+                "stop_distance_mm": 100,
+                "last_error": "LiDAR is unavailable outside UNO Q hardware mode",
+            }
+        return self.lidar.scan_status(include_points=False)
 
     def _handle_action(self, call: MotionCall) -> ActionResult:
         print(proposed_line(call))
@@ -520,7 +544,13 @@ class RobotApp:
                     print(cancelled_line(call))
                     return ActionResult(interruption=b"")
                 self.set_state(State.ACTING)
-                content = execute_motion(call, self.motion_stop)
+                if self.lidar is not None:
+                    self.lidar.clear_emergency_latch()
+                content = (
+                    execute_motion(call, self.motion_stop, self.lidar.guard_reason)
+                    if HARDWARE_MOTION and self.lidar is not None
+                    else execute_motion(call, self.motion_stop)
+                )
         finally:
             self.set_state(State.PROCESSING)
             time.sleep(POST_MOTION_MIC_COOLDOWN_SECONDS)
@@ -576,6 +606,8 @@ class RobotApp:
             stop_motors("python_shutdown")
         if self.live_view is not None:
             self.live_view.close()
+        if self.lidar is not None:
+            self.lidar.close()
         self.capture_stop.set()
         self.can_listen.set()
         self.turn_queue.put(None)
@@ -619,6 +651,7 @@ def load_settings() -> Settings:
         output_device=os.getenv("OUTPUT_DEVICE"),
         playback_gain=playback_gain,
         camera_index=camera_index,
+        lidar_port=os.getenv("LIDAR_PORT") or None,
     )
 
 
@@ -642,7 +675,20 @@ def create_robot_app() -> RobotApp:
         camera_index=settings.camera_index,
         physical_motion=HARDWARE_MOTION,
     )
-    live_view = LiveCameraView(agent.camera) if HARDWARE_MOTION else None
+    lidar = (
+        YDLidarX2(
+            port=settings.lidar_port,
+            stop_distance_mm=100,
+            required=True,
+        )
+        if HARDWARE_MOTION
+        else None
+    )
+    live_view = (
+        LiveCameraView(agent.camera, lidar.scan_status)
+        if HARDWARE_MOTION and lidar is not None
+        else None
+    )
     llm_provider = "Cerebras" if settings.cerebras_api_keys else "Groq"
     print(f"[MODEL] LLM: {llm_provider} / {agent.llm_model}")
     print(f"[MODEL] STT: Groq / {agent.stt_model}")
@@ -652,6 +698,7 @@ def create_robot_app() -> RobotApp:
         agent,
         VoiceIO(settings.mic_device, settings.output_device, settings.playback_gain),
         live_view,
+        lidar,
     )
 
 

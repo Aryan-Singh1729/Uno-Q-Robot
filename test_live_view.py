@@ -12,6 +12,7 @@ class FakeWebUI:
         self.handlers = {}
         self.messages = []
         self.frame_seen = threading.Event()
+        self.lidar_seen = threading.Event()
 
     def on_message(self, name, callback):
         self.handlers[name] = callback
@@ -20,6 +21,8 @@ class FakeWebUI:
         self.messages.append((name, message))
         if name == "camera_frame":
             self.frame_seen.set()
+        if name == "lidar_scan":
+            self.lidar_seen.set()
 
 
 class FakeCamera:
@@ -41,7 +44,21 @@ class LiveCameraViewTests(unittest.TestCase):
             "arduino.app_bricks.web_ui": web_ui,
         }
         with patch.dict(sys.modules, modules):
-            return LiveCameraView(FakeCamera(), fps=8)
+            return LiveCameraView(
+                FakeCamera(),
+                lambda _include_points: {
+                    "connected": True,
+                    "scan_fresh": True,
+                    "front_distance_mm": 95,
+                    "nearest_distance_mm": 95,
+                    "nearest_angle_deg": 0,
+                    "stop_distance_mm": 100,
+                    "emergency_active": True,
+                    "points": [[0, 95]],
+                },
+                fps=8,
+                lidar_fps=8,
+            )
 
     def test_publishes_frames_and_emergency_stop(self):
         view = self.make_view()
@@ -49,11 +66,14 @@ class LiveCameraViewTests(unittest.TestCase):
         view.set_emergency_stop(lambda: stopped.append(True))
         view.start()
         self.assertTrue(view.ui.frame_seen.wait(timeout=1))
+        self.assertTrue(view.ui.lidar_seen.wait(timeout=1))
         view.ui.handlers["emergency_stop"]("client", {})
         view.close()
         self.assertEqual(stopped, [True])
         frame = next(message for name, message in view.ui.messages if name == "camera_frame")
         self.assertEqual(frame["image"], "anBlZw==")
+        scan = next(message for name, message in view.ui.messages if name == "lidar_scan")
+        self.assertEqual(scan["stop_distance_mm"], 100)
         self.assertIn(("robot_status", {"state": "stopped", "detail": "Emergency stop requested from live view"}), view.ui.messages)
 
 

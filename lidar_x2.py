@@ -19,21 +19,27 @@ class YDLidarX2:
         *,
         front_angle_deg: float = 0.0,
         half_width_deg: float = 25.0,
-        stop_distance_mm: int = 300,
+        stop_distance_mm: int = 100,
         required: bool = True,
     ) -> None:
         self.requested_port = port.strip() if port else None
         self.port: str | None = None
         self.front_angle_deg = front_angle_deg % 360.0
         self.half_width_deg = max(5.0, min(90.0, half_width_deg))
-        self.stop_distance_mm = max(100, stop_distance_mm)
+        # X2's specified near limit and this build's fixed emergency boundary.
+        # Never allow a configuration value to expand the requested 10 cm zone.
+        self.stop_distance_mm = min(100, max(1, stop_distance_mm))
         self.required = required
         self.serial: Any = None
+        self._serial_module: Any = None
         self.running = False
         self.thread: threading.Thread | None = None
         self.lock = threading.Lock()
         self.points: dict[int, tuple[float, float]] = {}
         self.last_packet_at = 0.0
+        self.packet_count = 0
+        self.emergency_latched = False
+        self.emergency_distance_mm = 0
         self.last_error = "not started"
 
     @staticmethod
@@ -50,50 +56,79 @@ class YDLidarX2:
             print(f"[LIDAR] unavailable: {self.last_error}")
             return
 
+        self._serial_module = serial
+        self.running = True
+        self._open_serial()
+        self.thread = threading.Thread(target=self._reader_loop, name="ydlidar-x2", daemon=True)
+        self.thread.start()
+
+    def _open_serial(self) -> bool:
         ports = [self.requested_port] if self.requested_port else self.candidate_ports()
         print(f"[LIDAR] candidate serial ports: {ports or 'none'}")
         for port in ports:
             if not port:
                 continue
             try:
-                connection = serial.Serial(port, self.BAUDRATE, timeout=0.2)
+                connection = self._serial_module.Serial(port, self.BAUDRATE, timeout=0.2)
                 connection.reset_input_buffer()
                 # X2 adapters support motor control through DTR. Start with
                 # asserted DTR and automatically toggle it if no stream arrives.
-                connection.dtr = True
+                try:
+                    connection.dtr = True
+                except Exception as exc:
+                    print(f"[LIDAR] adapter DTR control unavailable on {port}: {exc}")
                 self.serial = connection
                 self.port = port
                 self.last_error = "waiting for scan packets"
-                break
+                print(f"[LIDAR] opened YDLIDAR X2 serial port {self.port} at {self.BAUDRATE} baud")
+                return True
             except Exception as exc:
                 self.last_error = f"cannot open {port}: {exc}"
         if self.serial is None:
             print(f"[LIDAR] unavailable: {self.last_error}")
-            return
+        return False
 
-        self.running = True
-        self.thread = threading.Thread(target=self._reader_loop, name="ydlidar-x2", daemon=True)
-        self.thread.start()
-        print(f"[LIDAR] opened YDLIDAR X2 serial port {self.port} at {self.BAUDRATE} baud")
+    def _disconnect_serial(self) -> None:
+        connection = self.serial
+        self.serial = None
+        self.port = None
+        if connection is not None:
+            try:
+                connection.dtr = False
+                connection.close()
+            except Exception:
+                pass
 
     def _reader_loop(self) -> None:
         buffer = bytearray()
         opened_at = time.monotonic()
         dtr_toggled = False
         while self.running:
+            if self.serial is None:
+                if self._open_serial():
+                    buffer.clear()
+                    opened_at = time.monotonic()
+                    dtr_toggled = False
+                else:
+                    time.sleep(1.0)
+                    continue
             try:
                 chunk = self.serial.read(4096)
                 if chunk:
                     buffer.extend(chunk)
                     self._consume(buffer)
                 elif not dtr_toggled and time.monotonic() - opened_at >= 2:
-                    self.serial.dtr = not bool(self.serial.dtr)
                     dtr_toggled = True
-                    print("[LIDAR] no packets yet; toggled adapter DTR motor control")
+                    try:
+                        self.serial.dtr = not bool(self.serial.dtr)
+                        print("[LIDAR] no packets yet; toggled adapter DTR motor control")
+                    except Exception as exc:
+                        print(f"[LIDAR] cannot toggle adapter DTR: {exc}")
             except Exception as exc:
                 self.last_error = f"serial read failed: {exc}"
                 print(f"[LIDAR] {self.last_error}")
-                self.running = False
+                self._disconnect_serial()
+                time.sleep(0.5)
 
     def _consume(self, buffer: bytearray) -> None:
         while True:
@@ -123,6 +158,7 @@ class YDLidarX2:
                 for angle, distance in points:
                     self.points[round(angle) % 360] = (distance, now)
                 self.last_packet_at = now
+                self.packet_count += 1
                 self.last_error = ""
 
     @classmethod
@@ -170,46 +206,75 @@ class YDLidarX2:
                 if now - timestamp <= 1.0
                 and abs((angle - self.front_angle_deg + 180) % 360 - 180)
                 <= self.half_width_deg
-                and 100 <= distance <= 8_000
+                and 0 < distance <= 8_000
             ]
         return sorted(readings)
 
+    def _fresh_points(self) -> list[tuple[int, float]]:
+        now = time.monotonic()
+        with self.lock:
+            return sorted(
+                (angle, distance)
+                for angle, (distance, timestamp) in self.points.items()
+                if now - timestamp <= 1.0 and 0 < distance <= 8_000
+            )
+
     def status(self) -> dict[str, Any]:
         readings = self._front_readings()
+        points = self._fresh_points()
         fresh = time.monotonic() - self.last_packet_at <= 1.0
-        # Use the second-nearest point to reject a single isolated reflection.
-        front_mm = readings[1] if len(readings) >= 2 else None
+        front_mm = readings[0] if readings else None
+        nearest_angle, nearest_mm = min(points, key=lambda item: item[1]) if points else (-1, None)
+        emergency_active = nearest_mm is not None and nearest_mm <= self.stop_distance_mm
         return {
             "model": "YDLIDAR X2",
+            "source": "Linux USB serial adapter",
             "required": self.required,
             "port": self.port,
             "connected": self.serial is not None and self.running,
             "scan_fresh": fresh,
             "front_distance_mm": round(front_mm) if front_mm is not None else None,
             "front_sample_count": len(readings),
+            "nearest_distance_mm": round(nearest_mm) if nearest_mm is not None else 0,
+            "nearest_angle_deg": nearest_angle,
             "stop_distance_mm": self.stop_distance_mm,
             "front_angle_deg": self.front_angle_deg,
+            "front_half_width_deg": self.half_width_deg,
+            "packet_count": self.packet_count,
+            "emergency_latched": self.emergency_latched,
+            "emergency_active": emergency_active,
+            "emergency_distance_mm": self.emergency_distance_mm,
             "last_error": self.last_error or None,
         }
+
+    def scan_status(self, include_points: bool = True) -> dict[str, Any]:
+        status = self.status()
+        if include_points:
+            status["points"] = [
+                [angle, round(distance)]
+                for angle, distance in self._fresh_points()
+                if angle % 2 == 0
+            ]
+        return status
 
     def guard_reason(self) -> str | None:
         status = self.status()
         if not status["connected"] or not status["scan_fresh"]:
             return "YDLIDAR X2 scan unavailable" if self.required else None
-        distance = status["front_distance_mm"]
-        if isinstance(distance, int) and distance <= self.stop_distance_mm:
-            return f"YDLIDAR X2 obstacle at {distance / 10:.1f} cm"
+        points = self._fresh_points()
+        distance = min((item[1] for item in points), default=0.0)
+        if 0 < distance <= self.stop_distance_mm:
+            self.emergency_latched = True
+            self.emergency_distance_mm = round(distance)
+            return f"YDLIDAR X2 emergency stop at {distance / 10:.1f} cm"
         return None
+
+    def clear_emergency_latch(self) -> None:
+        self.emergency_latched = False
+        self.emergency_distance_mm = 0
 
     def close(self) -> None:
         self.running = False
         if self.thread is not None:
             self.thread.join(timeout=1)
-        if self.serial is not None:
-            try:
-                self.serial.dtr = False
-                self.serial.close()
-            except Exception:
-                pass
-            self.serial = None
-
+        self._disconnect_serial()

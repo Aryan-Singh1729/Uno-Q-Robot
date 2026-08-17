@@ -1,26 +1,29 @@
-# WALL-E UNO Q timed-motion voice robot - v15.4
+# WALL-E UNO Q LiDAR-guarded robot - v16.0
 
 This is one Arduino App Lab application containing both UNO Q processors:
 
 - `python/main.py` launches microphone capture, transcription, autonomous tool calling,
   camera inspection, the live Web UI, and speech output on the Linux MPU.
-- `sketch/sketch.ino` runs deterministic TB6612 motor control on the STM32 MCU.
+- `sketch/sketch.ino` runs deterministic TB6612 motor control and the YDLIDAR X2
+  emergency guard on the STM32 MCU.
 - Arduino App Lab Bridge connects them. No SSH launch or separate Arduino upload is used.
 
-## Observe-think-act mode
+## LiDAR emergency guard
 
-The HC-SR04, VL53L0X, MPU6050, and YDLIDAR X2 integrations are not loaded as motion guards in
-this build. Disconnected or stale sensors cannot block a command. Direct forward/backward and
-left/right instructions are parsed deterministically instead of being inferred from conversation
-history. Find-and-move tasks run in a persistent camera loop that searches, aligns, approaches,
-and rechecks the goal after every short timed action. The MCU still stops if Python status polling
-disappears for 750 ms, and `/stop` remains available as an emergency brake.
+This build focuses only on the YDLIDAR X2. Linux reads it through the X2 USB-to-UART adapter and
+checks the scan before starting a command and every 50 ms while motors run. Any fresh point
+anywhere in the 360-degree scan at **100 mm or closer** sends `stop_robot` through the Bridge,
+which brakes all four motors. The configured forward sector is reported separately for navigation.
+Motion is rejected or stopped when the required LiDAR scan is missing or stale. HC-SR04,
+VL53L0X, and MPU6050 remain disabled. The MCU's independent 750 ms Python-controller watchdog
+still stops motion if Linux or the Bridge stops responding.
 
 ```text
 microphone -> FIFO utterance queue -> Whisper transcript -> observe/plan
            -> inspect camera -> move/timed turn -> inspect again
            -> silent validated motion -> Bridge RPC
            -> TB6612 motor outputs
+YDLIDAR X2 -> USB serial adapter -> Linux 10 cm guard -> Bridge -> four-motor brake
 ```
 
 ## Hardware safety
@@ -29,7 +32,13 @@ microphone -> FIFO utterance queue -> Whisper transcript -> observe/plan
 - Power the motors from a suitable external motor supply, not the UNO Q 3.3 V rail.
 - Join the motor-supply ground, both TB6612 grounds, and UNO Q ground.
 - Tie both TB6612 `STBY` inputs to D2, as required by the sketch.
-- Leave the X2 disconnected for this motor-only test.
+- Connect the X2 to its USB-to-UART/motor-control adapter and connect that adapter to the UNO Q
+  Linux USB host through the powered hub.
+- Do **not** connect the X2 data wire to D0/D1 in this App Lab build. UNO Q reserves `Serial1`
+  on those pins for `Arduino_RouterBridge`; sharing it would break motor RPC commands.
+- Power the X2/adapter from its specified 5 V source and confirm the scanner is rotating.
+- Mount the X2 with its zero-degree direction facing the front of the chassis. If the map appears
+  rotated, adjust `LIDAR_FRONT_ANGLE_DEG` in `sketch/sketch.ino` and rebuild.
 - Keep a physical power disconnect within reach.
 
 ## App layout
@@ -79,7 +88,8 @@ CAMERA_INDEX=0
 # MIC_DEVICE=0
 # OUTPUT_DEVICE=1
 
-# Sensor and LiDAR motion gating is not loaded in v15.
+# LIDAR_PORT=/dev/ydlidar
+# The emergency threshold is fixed at exactly 100 mm in lidar_x2.py.
 ```
 
 When `CEREBRAS_API_KEYS` is non-empty, text planning uses Cerebras while Groq continues to
@@ -91,19 +101,22 @@ HTTP 429. `openai/gpt-oss-120b` is translated to Cerebras model ID `gpt-oss-120b
 
 1. Stop and delete the previous app so its build cache is not reused.
 2. Import the newest ZIP from this repository.
-3. Recreate `.env` with your private keys. You do not need to connect the LiDAR.
-4. Connect the UNO Q, powered hub, EMEET SmartCam, and audio output.
+3. Recreate `.env` with your private keys.
+4. Connect the X2 USB serial adapter through the powered USB hub, plus the EMEET SmartCam and
+   audio output. Do not use D0/D1 for the X2 while RouterBridge is enabled.
 5. Click **Run** once and let both sides finish building.
 6. Confirm these messages appear:
 
 ```text
-[MCU] motor-map-v15.4 Bridge ready; turn semantics corrected
+[MCU] lidar-guard-v16.0 Bridge ready; Serial1 reserved for RouterBridge
+[LIDAR] opened YDLIDAR X2 serial port /dev/ttyUSB... at 115200 baud
 [MOTOR] UNO Q MCU bridge is ready
-[WEB] live camera view: http://arduinoq.local:7000
+[LIDAR] Linux USB emergency guard configured at 10.0 cm
+[WEB] live camera + LiDAR view: http://arduinoq.local:7000
 [AUDIO] ... EMEET SmartCam ... -> selected
 ```
 
-The Python app requires the exact `motor-map-v15.4` MCU handshake. If App Lab leaves an older
+The Python app requires the exact `lidar-guard-v16.0` MCU handshake. If App Lab leaves an older
 sensor sketch flashed, startup fails explicitly instead of silently using stale firmware.
 
 For a direct test, keep the wheels raised and say:
@@ -121,7 +134,9 @@ Expected motion logs are:
 [MOTOR] motion ... finished: completed
 ```
 
-In this build a disconnected X2 does not appear at startup and cannot block movement.
+Before testing the motors, type `/lidar` in the App Lab Python console. A healthy result has
+`"connected": true`, `"scan_fresh": true`, and a rising `packet_count`. Motion remains blocked
+if those fields are false.
 
 For an autonomous test, put the robot on a clear floor and say:
 
@@ -132,8 +147,24 @@ Find a shoe in this room and move toward it.
 The controller inspects a frame, rotates in short timed increments while searching, centers the target,
 and approaches in 0.75-second steps (0.35 seconds when it looks large), taking a fresh frame after every
 action. It speaks only three milestones: searching, target found/approaching, and target reached.
-Open `http://arduinoq.local:7000` in a browser while the app runs to see the shared live camera
-feed, task state, and emergency-stop button. The App Lab globe is only network/device status.
+Open the **Network URL printed by WebUI** (or `http://arduinoq.local:7000`) while the app runs.
+The page shows the camera, a live polar LiDAR map, front and nearest-obstacle distances,
+nearest-obstacle angle, connection/freshness state,
+the fixed red 10 cm boundary, task state, and the manual emergency-stop button. The App Lab globe
+is only network/device status.
+
+## Test the 10 cm stop
+
+1. Raise the wheels first and keep the physical power cutoff within reach.
+2. Start the app and confirm `/lidar` reports a fresh scan.
+3. Put a flat, opaque target in front of the LiDAR and verify the live map orientation.
+4. Command a short, low-speed motion.
+5. Move the target into the scan plane from any direction at 10 cm. The MCU log and motion result should report
+   `YDLIDAR X2 emergency stop`, and all four motor outputs should brake.
+
+The X2's documented measurement range begins at 0.10 m, so 10 cm is the edge of its specified
+range. This build follows the requested threshold exactly and does not stop for readings above
+100 mm. Readings below the sensor's reliable range cannot be guaranteed by software.
 
 ## Audio and camera behavior
 

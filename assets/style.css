@@ -1,15 +1,25 @@
 :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; }
 * { box-sizing: border-box; }
 body { margin: 0; min-height: 100vh; background: #071316; color: #eefafa; }
-main { width: min(1100px, 94vw); margin: 0 auto; padding: 28px 0; }
+main { width: min(1500px, 96vw); margin: 0 auto; padding: 28px 0; }
 header { display: flex; justify-content: space-between; align-items: center; gap: 20px; }
 h1 { margin: 2px 0 18px; font-size: clamp(24px, 4vw, 42px); }
 .eyebrow { margin: 0; color: #52d7d8; font: 700 12px monospace; letter-spacing: .18em; }
 button { border: 0; border-radius: 10px; background: #df3e46; color: white; padding: 14px 18px; font-weight: 800; cursor: pointer; }
-.camera-card { position: relative; overflow: hidden; border: 1px solid #21464b; border-radius: 18px; background: #020607; min-height: 360px; display: grid; place-items: center; }
+.telemetry-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(340px, .8fr); gap: 16px; }
+.view-card { overflow: hidden; border: 1px solid #21464b; border-radius: 18px; background: #020607; }
+.card-heading { padding: 13px 16px; display: flex; justify-content: space-between; align-items: baseline; border-bottom: 1px solid #17363a; }
+.card-heading h2 { margin: 0; font-size: 17px; }
+.card-heading span { color: #78989a; font: 12px monospace; }
+.camera-stage { position: relative; min-height: 360px; display: grid; place-items: center; }
 canvas { width: 100%; height: auto; display: block; }
+#lidar { aspect-ratio: 1; background: #020607; }
 #placeholder { position: absolute; color: #8fa9aa; }
+.lidar-readout { padding: 13px 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; border-top: 1px solid #17363a; color: #a9c1c2; }
+.lidar-readout strong { color: #eefafa; }
 .status-card { margin-top: 14px; padding: 16px; border: 1px solid #21464b; border-radius: 14px; background: #0d2024; display: flex; align-items: center; gap: 12px; }
 .badge { border-radius: 99px; padding: 6px 10px; background: #0c7578; font: 700 12px monospace; text-transform: uppercase; }
 .badge.error { background: #a92e36; }
+.badge.warning { background: #a66c14; }
+@media (max-width: 900px) { .telemetry-grid { grid-template-columns: 1fr; } }
 @media (max-width: 650px) { header { align-items: flex-start; flex-direction: column; } button { width: 100%; } }

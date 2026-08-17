@@ -1,4 +1,4 @@
-# WALL-E UNO Q timed-motion voice robot - v15.2
+# WALL-E UNO Q timed-motion voice robot - v15.4
 
 This is one Arduino App Lab application containing both UNO Q processors:
 
@@ -97,13 +97,13 @@ HTTP 429. `openai/gpt-oss-120b` is translated to Cerebras model ID `gpt-oss-120b
 6. Confirm these messages appear:
 
 ```text
-[MCU] motor-map-v15.2 Bridge ready; rear channel ownership corrected
+[MCU] motor-map-v15.4 Bridge ready; turn semantics corrected
 [MOTOR] UNO Q MCU bridge is ready
 [WEB] live camera view: http://arduinoq.local:7000
 [AUDIO] ... EMEET SmartCam ... -> selected
 ```
 
-The Python app requires the exact `motor-map-v15.2` MCU handshake. If App Lab leaves an older
+The Python app requires the exact `motor-map-v15.4` MCU handshake. If App Lab leaves an older
 sensor sketch flashed, startup fails explicitly instead of silently using stale firmware.
 
 For a direct test, keep the wheels raised and say:
@@ -146,8 +146,11 @@ A short post-playback cooldown prevents the robot hearing its own milestone. Com
 are processed in FIFO order; newer speech does not cancel the active turn. Microphone capture is
 also closed during each physical action so motor and gearbox noise is not queued as a command.
 If the USB camera temporarily disconnects, the app refreshes PortAudio, reselects the microphone,
-and retries without terminating. Camera-node scans use exponential backoff up to 10 seconds so a
-missing composite camera/microphone cannot create a continuous ALSA/V4L2 retry storm.
+and retries without terminating. Recovery follows the original microphone by its stable USB name,
+even when Linux assigns it a different ALSA card number; it will not silently switch from the EMEET
+microphone to an unrelated USB sound card. Repeated PortAudio input overflows close and reopen the
+stream once instead of flooding the callback indefinitely. Camera-node scans use exponential backoff
+up to 10 seconds, and a newly enumerated UVC camera gets three warm-up reads before it is rejected.
 
 Vision tries each `/dev/video*` node if the configured camera opens but returns no frame. The
 same camera object supplies both Qwen inspections and the Web UI feed, avoiding two processes
@@ -179,14 +182,12 @@ The expected physical wheel directions are:
 | --- | --- | --- | --- | --- |
 | Forward | forward | forward | forward | forward |
 | Backward | backward | backward | backward | backward |
-| Left | backward | backward | forward | forward |
-| Right | forward | forward | backward | backward |
+| Left | forward | forward | backward | backward |
+| Right | backward | backward | forward | forward |
 
-For a right turn, rear-right is now Driver 2 channel B (`D9` PWM, `A1` BIN1, `A2` BIN2) and
-receives the same reverse electrical state that already works during a whole-robot backward
-command. If that wheel still stops only during a right turn at the same requested speed after
-v15.2 is confirmed in the MCU log, inspect the Driver 2 B wiring/terminal for an intermittent
-connection rather than changing its polarity again.
+The final floor test showed that the assembled chassis turns opposite to the raw tank-turn sign,
+so v15.4 inverts only the requested turn direction at the MCU boundary. Channel ownership,
+individual motor polarity, and the already-correct forward/backward outputs are unchanged.
 
 ## Tests
 

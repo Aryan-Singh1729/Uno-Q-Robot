@@ -86,8 +86,12 @@ static void setAllMotors(int direction, uint8_t pwm) {
 }
 
 static void setTankTurn(int direction, uint8_t pwm) {
-  const int left = direction > 0 ? -1 : 1;
-  const int right = direction > 0 ? 1 : -1;
+  // Final floor test: the chassis turns opposite to the requested semantic
+  // direction with the raw tank-turn sign. Correct it once here so voice,
+  // autonomous vision alignment, and every Bridge caller use the same rule.
+  const int correctedDirection = -direction;
+  const int left = correctedDirection > 0 ? -1 : 1;
+  const int right = correctedDirection > 0 ? 1 : -1;
   setMotor(D1_AIN1, D1_AIN2, D1_PWMA, left * FRONT_LEFT_POLARITY, pwm);
   setMotor(D1_BIN1, D1_BIN2, D1_PWMB, left * REAR_LEFT_POLARITY, pwm);
   setMotor(D2_AIN1, D2_AIN2, D2_PWMA, right * FRONT_RIGHT_POLARITY, pwm);
@@ -135,7 +139,7 @@ static String statusJson() {
   json += "\"motion_id\":" + String(motionId) + ",";
   json += "\"status\":\"" + jsonEscape(motionStatus) + "\",";
   json += "\"reason\":\"" + jsonEscape(motionReason) + "\",";
-  json += "\"firmware_version\":\"motor-map-v15.2\",";
+  json += "\"firmware_version\":\"motor-map-v15.4\",";
   json += "\"motor_map\":\"D1A=front_left,D1B=rear_left,D2A=front_right,D2B=rear_right\",";
   json += "\"motor_test_mode\":true,";
   json += "\"sensor_guard_enabled\":false";
@@ -278,8 +282,8 @@ void setup() {
   Bridge.provide_safe("robot_status", robot_status);
   Bridge.provide_safe("read_sensors", read_sensors);
   bridgeReady = true;
-  motionReason = "motor-map-v15.2 ready";
-  Serial.println("[MCU] motor-map-v15.2 Bridge ready; rear channel ownership corrected");
+  motionReason = "motor-map-v15.4 ready";
+  Serial.println("[MCU] motor-map-v15.4 Bridge ready; turn semantics corrected");
 }
 
 void loop() {

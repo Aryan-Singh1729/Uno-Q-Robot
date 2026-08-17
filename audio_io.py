@@ -6,6 +6,7 @@ import io
 import math
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -31,6 +32,43 @@ END_SPEECH_RUN_FRAMES = 3
 MIN_SPEECH_FRAMES = 300 // FRAME_MS
 MAX_UTTERANCE_FRAMES = 60_000 // FRAME_MS
 INPUT_RATE_CANDIDATES = (SAMPLE_RATE, 48_000, 44_100, 32_000, 8_000)
+CAPTURE_QUEUE_FRAMES = 32
+INPUT_OVERFLOW_RESTART_COUNT = 6
+INPUT_OVERFLOW_WINDOW_SECONDS = 2.0
+
+
+def _stable_device_name(name: str) -> str:
+    """Remove ALSA card numbers that can change after a USB reconnect."""
+    normalized = " ".join(name.casefold().split())
+    return re.sub(r"\s*\((?:plug)?hw:\d+,\d+\)\s*$", "", normalized)
+
+
+class _InputStatusTracker:
+    """Turn a sustained PortAudio overflow storm into one recoverable error."""
+
+    def __init__(self) -> None:
+        self._overflow_times: deque[float] = deque()
+        self._restart = threading.Event()
+
+    def report(self, status: object) -> None:
+        if not status:
+            return
+        message = str(status).casefold()
+        if not getattr(status, "input_overflow", False) and "input overflow" not in message:
+            return
+        now = time.monotonic()
+        self._overflow_times.append(now)
+        cutoff = now - INPUT_OVERFLOW_WINDOW_SECONDS
+        while self._overflow_times and self._overflow_times[0] < cutoff:
+            self._overflow_times.popleft()
+        if len(self._overflow_times) >= INPUT_OVERFLOW_RESTART_COUNT:
+            self._restart.set()
+
+    def raise_if_unhealthy(self) -> None:
+        if self._restart.is_set():
+            raise OSError(
+                "microphone input overflow repeated; reopening the preferred USB microphone"
+            )
 
 
 class UtteranceDetector:
@@ -183,6 +221,7 @@ class VoiceIO:
         self.sd = sounddevice
         self.vad = webrtcvad.Vad(3)
         self.input_device: int | str | None = None
+        self.input_device_name: str | None = None
         self.requested_input_device = input_device
         self.input_rate = SAMPLE_RATE
         self.output_device = _device(output_device)
@@ -239,10 +278,23 @@ class VoiceIO:
         candidate = _device(value)
         if candidate is None:
             candidate = self._automatic_input_device()
+        return self._activate_input_device(candidate)
+
+    def _activate_input_device(self, candidate: int | str | None) -> str:
         info = self.sd.query_devices(candidate, "input")
         self.input_rate = self._supported_input_rate(candidate, info)
         self.input_device = candidate
-        return str(info["name"])
+        self.input_device_name = str(info["name"])
+        return self.input_device_name
+
+    def _input_device_named(self, name: str) -> int | None:
+        target = _stable_device_name(name)
+        for index, info in enumerate(self.sd.query_devices()):
+            if int(info.get("max_input_channels", 0)) < 1:
+                continue
+            if _stable_device_name(str(info.get("name", ""))) == target:
+                return index
+        return None
 
     def is_input_error(self, exc: BaseException) -> bool:
         """Return whether a failed PortAudio/ALSA capture can be retried."""
@@ -253,7 +305,12 @@ class VoiceIO:
         return isinstance(exc, retryable)
 
     def recover_input_device(self) -> str:
-        """Refresh PortAudio after a USB microphone disconnect and select it again."""
+        """Refresh PortAudio and follow the original microphone across USB index changes."""
+        preferred_name = getattr(self, "input_device_name", None)
+        if preferred_name:
+            # The numeric ALSA card index is no longer trustworthy after a
+            # composite webcam reset. Keep only the stable device identity.
+            self.input_device = None
         stop = getattr(self.sd, "stop", None)
         if callable(stop):
             try:
@@ -268,9 +325,22 @@ class VoiceIO:
             except Exception:
                 pass
             initialize()
-        name = self.set_input_device(self.requested_input_device)
+        if preferred_name:
+            candidate = self._input_device_named(preferred_name)
+            if candidate is None:
+                # Do not silently bind to a different USB sound card. A stale
+                # numeric ALSA index can now refer to the speaker or another mic.
+                stable_name = _stable_device_name(preferred_name)
+                raise OSError(f"preferred microphone {stable_name!r} has not reconnected yet")
+            name = self._activate_input_device(candidate)
+        else:
+            name = self.set_input_device(self.requested_input_device)
         print(f"[AUDIO] microphone recovered: {name} at {self.input_rate} Hz")
         return name
+
+    def _ensure_input_available(self) -> None:
+        if self.input_device is None and self.input_device_name:
+            raise OSError("preferred USB microphone is waiting to reconnect")
 
     def _automatic_input_device(self) -> int | str | None:
         devices = self.sd.query_devices()
@@ -355,11 +425,12 @@ class VoiceIO:
         return pcm
 
     def _fixed_capture(self, seconds: float) -> list[bytes]:
+        self._ensure_input_available()
         frames: queue.Queue[bytes] = queue.Queue()
+        status_tracker = _InputStatusTracker()
 
         def callback(indata: bytes, _count: int, _time: object, status: object) -> None:
-            if status:
-                print(f"[AUDIO] {status}")
+            status_tracker.report(status)
             # Keep PortAudio's real-time callback minimal. Resampling here can
             # starve 48 kHz USB devices and produce repeated input overflows.
             frames.put(bytes(indata))
@@ -372,10 +443,13 @@ class VoiceIO:
             channels=1,
             dtype="int16",
             device=self.input_device,
+            latency="high",
             callback=callback,
         ):
             for _ in range(frame_count):
+                status_tracker.raise_if_unhealthy()
                 captured.append(self._capture_callback(frames.get(timeout=1)))
+            status_tracker.raise_if_unhealthy()
         return captured
 
     def _is_speech(self, frame: bytes) -> bool:
@@ -416,17 +490,27 @@ class VoiceIO:
         on_speech_start: Callable[[], None] | None = None,
         stop_event: threading.Event | None = None,
     ) -> bytes | None:
+        self._ensure_input_available()
         stop_event = stop_event or threading.Event()
-        frames: queue.Queue[bytes] = queue.Queue(maxsize=400)
+        frames: queue.Queue[bytes] = queue.Queue(maxsize=CAPTURE_QUEUE_FRAMES)
         detector = UtteranceDetector()
+        status_tracker = _InputStatusTracker()
 
         def callback(indata: bytes, _count: int, _time: object, status: object) -> None:
-            if status:
-                print(f"[AUDIO] {status}")
+            status_tracker.report(status)
             try:
                 frames.put_nowait(bytes(indata))
             except queue.Full:
-                pass
+                # Keep recent audio instead of accumulating seconds of stale
+                # speech when another USB callback briefly delays processing.
+                try:
+                    frames.get_nowait()
+                except queue.Empty:
+                    return
+                try:
+                    frames.put_nowait(bytes(indata))
+                except queue.Full:
+                    return
 
         with self.sd.RawInputStream(
             samplerate=self.input_rate,
@@ -434,6 +518,7 @@ class VoiceIO:
             channels=1,
             dtype="int16",
             device=self.input_device,
+            latency="high",
             callback=callback,
         ):
             if on_ready:
@@ -442,6 +527,7 @@ class VoiceIO:
             diagnostic_peak = 0
             diagnostic_rms = 0.0
             while not stop_event.is_set():
+                status_tracker.raise_if_unhealthy()
                 try:
                     frame = self._capture_callback(frames.get(timeout=0.1))
                 except queue.Empty:

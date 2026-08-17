@@ -124,7 +124,7 @@ class BridgeMotionTests(unittest.TestCase):
                             "ready": True,
                             "status": "idle",
                             "motion_id": 0,
-                            "firmware_version": "motor-map-v15.2",
+                            "firmware_version": "motor-map-v15.4",
                             "motor_test_mode": True,
                             "sensor_guard_enabled": False,
                         }

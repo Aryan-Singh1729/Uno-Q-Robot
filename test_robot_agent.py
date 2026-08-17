@@ -127,6 +127,44 @@ class MotionValidationTests(unittest.TestCase):
         self.assertEqual(result, "data:image/jpeg;base64,anBlZw==")
         self.assertTrue(opened[0].released)
 
+    def test_reenumerated_camera_gets_warmup_reads(self):
+        class Capture:
+            def __init__(self):
+                self.reads = 0
+
+            def set(self, *_args):
+                return True
+
+            @staticmethod
+            def isOpened():
+                return True
+
+            def read(self):
+                self.reads += 1
+                return (self.reads >= 2, object())
+
+            def release(self):
+                return None
+
+        class Encoded:
+            @staticmethod
+            def tobytes():
+                return b"jpeg"
+
+        capture = Capture()
+        fake_cv2 = SimpleNamespace(
+            VideoCapture=lambda _index: capture,
+            IMWRITE_JPEG_QUALITY=1,
+            imencode=lambda *_args: (True, Encoded()),
+        )
+        camera = Camera(0)
+        with patch.dict(sys.modules, {"cv2": fake_cv2}), patch(
+            "robot_agent.time.sleep", return_value=None
+        ):
+            result = camera.data_url()
+        self.assertEqual(result, "data:image/jpeg;base64,anBlZw==")
+        self.assertEqual(capture.reads, 2)
+
     def test_disconnected_camera_backs_off_before_rescanning_usb_nodes(self):
         open_count = 0
 

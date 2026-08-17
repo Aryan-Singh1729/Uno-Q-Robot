@@ -25,6 +25,8 @@ VISION_WORD_LIMIT = 100
 MAX_VISION_QUESTION_LENGTH = 300
 CAMERA_RETRY_INITIAL_SECONDS = 1.0
 CAMERA_RETRY_MAX_SECONDS = 10.0
+CAMERA_READ_ATTEMPTS = 3
+CAMERA_READ_RETRY_SECONDS = 0.05
 
 _NUMBER_WORD_VALUES = {
     "one": 1,
@@ -415,10 +417,21 @@ class Camera:
         if fourcc is not None and fourcc_prop is not None:
             capture.set(fourcc_prop, fourcc(*"MJPG"))
         if capture.isOpened():
-            ok, frame = capture.read()
-            if ok:
+            frame = self._read_frame(capture)
+            if frame is not None:
                 return capture, frame
         capture.release()
+        return None
+
+    @staticmethod
+    def _read_frame(capture: Any) -> Any | None:
+        """Allow a re-enumerated UVC camera a few frames to become ready."""
+        for attempt in range(CAMERA_READ_ATTEMPTS):
+            ok, frame = capture.read()
+            if ok:
+                return frame
+            if attempt + 1 < CAMERA_READ_ATTEMPTS:
+                time.sleep(CAMERA_READ_RETRY_SECONDS)
         return None
 
     def data_url(self) -> str:
@@ -435,10 +448,8 @@ class Camera:
         frame = None
         if self.capture is not None:
             if self.capture.isOpened():
-                ok, current = self.capture.read()
-                if ok:
-                    frame = current
-                else:
+                frame = self._read_frame(self.capture)
+                if frame is None:
                     self._release_capture()
             else:
                 self._release_capture()

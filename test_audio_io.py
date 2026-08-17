@@ -205,6 +205,116 @@ class UtteranceDetectorTests(unittest.TestCase):
         self.assertEqual(calls, ["stop", "terminate", "initialize", ("select", None)])
         self.assertTrue(voice.is_input_error(SoundDevice.PortAudioError("disconnected")))
 
+    def test_usb_recovery_follows_emeet_name_when_alsa_index_changes(self):
+        class SoundDevice:
+            class PortAudioError(Exception):
+                pass
+
+            @staticmethod
+            def stop():
+                pass
+
+            @staticmethod
+            def _terminate():
+                pass
+
+            @staticmethod
+            def _initialize():
+                pass
+
+            @staticmethod
+            def query_devices(device=None, kind=None):
+                devices = [
+                    {
+                        "name": "USB PnP Sound Device: Audio (hw:0,0)",
+                        "max_input_channels": 1,
+                    },
+                    {
+                        "name": "EMEET SmartCam C950: USB Audio (hw:1,0)",
+                        "max_input_channels": 1,
+                    },
+                ]
+                return devices if device is None else devices[device]
+
+        voice = VoiceIO.__new__(VoiceIO)
+        voice.sd = SoundDevice
+        voice.requested_input_device = None
+        voice.input_device = 0
+        voice.input_device_name = "EMEET SmartCam C950: USB Audio (hw:0,0)"
+        voice.input_rate = 16_000
+        voice._supported_input_rate = lambda candidate, info: 16_000
+        recovered = voice.recover_input_device()
+        self.assertEqual(recovered, "EMEET SmartCam C950: USB Audio (hw:1,0)")
+        self.assertEqual(voice.input_device, 1)
+
+    def test_usb_recovery_waits_instead_of_selecting_unrelated_sound_card(self):
+        class SoundDevice:
+            @staticmethod
+            def stop():
+                pass
+
+            @staticmethod
+            def _terminate():
+                pass
+
+            @staticmethod
+            def _initialize():
+                pass
+
+            @staticmethod
+            def query_devices(device=None, kind=None):
+                devices = [
+                    {
+                        "name": "USB PnP Sound Device: Audio (hw:0,0)",
+                        "max_input_channels": 1,
+                    }
+                ]
+                return devices if device is None else devices[device]
+
+        voice = VoiceIO.__new__(VoiceIO)
+        voice.sd = SoundDevice
+        voice.requested_input_device = None
+        voice.input_device = 0
+        voice.input_device_name = "EMEET SmartCam C950: USB Audio (hw:0,0)"
+        with self.assertRaisesRegex(OSError, "has not reconnected"):
+            voice.recover_input_device()
+        self.assertIsNone(voice.input_device)
+
+    def test_repeated_input_overflow_restarts_capture_instead_of_looping(self):
+        class Status:
+            input_overflow = True
+
+            @staticmethod
+            def __str__():
+                return "input overflow"
+
+        class Stream:
+            def __init__(self, callback):
+                self.callback = callback
+
+            def __enter__(self):
+                for _ in range(6):
+                    self.callback(b"\x00\x00" * 480, 480, object(), Status())
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+        class SoundDevice:
+            @staticmethod
+            def RawInputStream(**kwargs):
+                return Stream(kwargs["callback"])
+
+        voice = VoiceIO.__new__(VoiceIO)
+        voice.sd = SoundDevice
+        voice.input_device = 0
+        voice.input_device_name = "EMEET SmartCam"
+        voice.input_rate = 16_000
+        voice.speech_rms_threshold = 300
+        voice.vad = type("Vad", (), {"is_speech": lambda *_args: False})()
+        with self.assertRaisesRegex(OSError, "input overflow repeated"):
+            voice.capture()
+
     def test_pcm_response_is_played_as_chunks_arrive(self):
         writes = []
 

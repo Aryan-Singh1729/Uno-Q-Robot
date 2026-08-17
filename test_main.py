@@ -29,7 +29,8 @@ class AppPackagingTests(unittest.TestCase):
             "setMotor(D1_BIN1, D1_BIN2, D1_PWMB, left * REAR_LEFT_POLARITY, pwm);",
             "setMotor(D2_AIN1, D2_AIN2, D2_PWMA, right * FRONT_RIGHT_POLARITY, pwm);",
             "setMotor(D2_BIN1, D2_BIN2, D2_PWMB, right * REAR_RIGHT_POLARITY, pwm);",
-            '\\"firmware_version\\":\\"motor-map-v15.2\\"',
+            "const int correctedDirection = -direction;",
+            '\\"firmware_version\\":\\"motor-map-v15.4\\"',
             '\\"motor_map\\":\\"D1A=front_left,D1B=rear_left,D2A=front_right,D2B=rear_right\\"',
         )
         for line in expected_lines:
@@ -37,10 +38,10 @@ class AppPackagingTests(unittest.TestCase):
                 self.assertIn(line, sketch)
 
     def test_motor_map_produces_required_four_command_truth_table(self):
-        # Physical forward is +1 and physical backward is -1.  The polarity
-        # values convert those physical directions to each TB6612 channel's
-        # electrical direction.  These assertions preserve working straight
-        # motion while protecting the corrected rear-channel turn ownership.
+        # Physical forward is +1 and physical backward is -1. The final floor
+        # test established that this chassis needs the inverse tank-turn sign.
+        # These assertions preserve straight motion and protect that one
+        # semantic correction without changing channel ownership or polarity.
         channels = {
             "front_left": ("D1A", -1),
             "rear_left": ("D1B", -1),
@@ -61,16 +62,16 @@ class AppPackagingTests(unittest.TestCase):
                 "rear_right": -1,
             },
             "left": {
-                "front_left": -1,
-                "rear_left": -1,
-                "front_right": 1,
-                "rear_right": 1,
-            },
-            "right": {
                 "front_left": 1,
                 "rear_left": 1,
                 "front_right": -1,
                 "rear_right": -1,
+            },
+            "right": {
+                "front_left": -1,
+                "rear_left": -1,
+                "front_right": 1,
+                "rear_right": 1,
             },
         }
 
@@ -88,10 +89,10 @@ class AppPackagingTests(unittest.TestCase):
             electrical["backward"], {"D1A": 1, "D1B": 1, "D2A": -1, "D2B": -1}
         )
         self.assertEqual(
-            electrical["left"], {"D1A": 1, "D1B": 1, "D2A": 1, "D2B": 1}
+            electrical["left"], {"D1A": -1, "D1B": -1, "D2A": -1, "D2B": -1}
         )
         self.assertEqual(
-            electrical["right"], {"D1A": -1, "D1B": -1, "D2A": -1, "D2B": -1}
+            electrical["right"], {"D1A": 1, "D1B": 1, "D2A": 1, "D2B": 1}
         )
 
 

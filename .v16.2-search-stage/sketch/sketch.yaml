@@ -1,6 +1,0 @@
-profiles:
-  default:
-    fqbn: arduino:zephyr:unoq
-    platforms:
-      - platform: arduino:zephyr
-default_profile: default

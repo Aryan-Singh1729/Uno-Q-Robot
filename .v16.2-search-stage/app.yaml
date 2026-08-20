@@ -1,5 +1,0 @@
-name: WALL-E LiDAR Guard Robot v16.1
-description: Groq-only timed UNO Q motion with a USB YDLIDAR X2 10 cm emergency stop and live camera-plus-LiDAR view
-bricks:
-  - arduino:web_ui
-icon: 🤖

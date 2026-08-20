@@ -1,0 +1,6 @@
+groq
+numpy
+python-dotenv
+pyserial
+sounddevice
+webrtcvad-wheels

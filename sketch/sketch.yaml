@@ -3,4 +3,8 @@ profiles:
     fqbn: arduino:zephyr:unoq
     platforms:
       - platform: arduino:zephyr
+    libraries:
+      - Adafruit MPU6050 (2.2.9)
+      - Adafruit BusIO (1.17.4)
+      - Adafruit Unified Sensor (1.1.15)
 default_profile: default

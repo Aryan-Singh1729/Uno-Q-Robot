@@ -15,6 +15,7 @@ from enum import Enum
 from audio_io import VoiceIO
 from lidar_x2 import YDLidarX2
 from live_view import LiveCameraView
+from local_follower import LocalFollower
 from robot_agent import (
     ActionResult,
     GroqRobot,
@@ -22,6 +23,7 @@ from robot_agent import (
     TargetMission,
     cancelled_line,
     parse_direct_motion,
+    parse_follow_command,
     parse_target_mission,
     proposed_line,
 )
@@ -40,6 +42,7 @@ try:
         stop_motors,
         wait_for_mcu,
     )
+    from navigation_controller import NavigationController
 
     HARDWARE_MOTION = True
     print("[BOOT] Arduino App Lab Bridge detected - physical motor mode")
@@ -60,6 +63,8 @@ except ImportError as exc:
 
     def read_sensors() -> dict[str, object]:
         return {"status": "unavailable", "reason": "not running on UNO Q"}
+
+    NavigationController = None
 
     print("[BOOT] Arduino Bridge unavailable - simulated motion mode")
 
@@ -112,11 +117,13 @@ class RobotApp:
         audio: VoiceIO,
         live_view: LiveCameraView | None = None,
         lidar: YDLidarX2 | None = None,
+        navigator: object | None = None,
     ) -> None:
         self.agent = agent
         self.audio = audio
         self.live_view = live_view
         self.lidar = lidar
+        self.navigator = navigator
         self.state: State | None = None
         self.running = True
         self.command_queue: queue.Queue[str] = queue.Queue()
@@ -130,6 +137,16 @@ class RobotApp:
         self.motion_stop = threading.Event()
         self.audio_retry_delay = AUDIO_RETRY_INITIAL_SECONDS
         self.worker: threading.Thread | None = None
+        self.follower: LocalFollower | None = None
+        if lidar is not None and navigator is not None:
+            status_callback = live_view.publish_status if live_view is not None else None
+            self.follower = LocalFollower(
+                agent.camera,
+                lidar,
+                self._handle_action,
+                navigator.emit_event,
+                status_callback,
+            )
 
     def set_state(self, state: State) -> None:
         if state != self.state:
@@ -252,8 +269,19 @@ class RobotApp:
         if self.live_view is not None:
             self.live_view.publish_status("planning", transcript)
 
+        follow_command = parse_follow_command(transcript)
+        if follow_command is not None:
+            operation, target = follow_command
+            if operation == "stop":
+                self._stop_follower("voice command")
+                self._speak("I stopped following.")
+            else:
+                self._start_follower(target)
+            return
+
         mission = parse_target_mission(transcript)
         if mission is not None:
+            self._stop_follower("new target mission")
             self._run_target_mission(mission)
             return
 
@@ -264,6 +292,7 @@ class RobotApp:
             self._speak(f"That motion value is invalid: {exc}.")
             return
         if direct_motion is not None:
+            self._stop_follower("new direct motion command")
             self._handle_action(direct_motion)
             return
 
@@ -284,6 +313,40 @@ class RobotApp:
             print("[PROCESSING] stale response discarded")
         elif outcome.reply:
             self._speak(outcome.reply)
+
+    def _start_follower(self, target: str) -> None:
+        if self.follower is None:
+            self._speak("Local following is unavailable because the camera or LiDAR is offline.")
+            return
+        self._stop_follower("replaced by a new follow target")
+        self.set_state(State.PROCESSING)
+        try:
+            identified = self.agent.identify_follow_target(target, self._turn_cancelled)
+        except InterruptedError:
+            return
+        except Exception as exc:
+            print(f"[FOLLOW] target initialization failed: {exc}")
+            self._speak("I could not initialize that follow target from the camera.")
+            return
+        if not identified.visible or identified.bbox is None:
+            self._speak("I cannot clearly see the follow target yet.")
+            return
+        try:
+            self.motion_stop.clear()
+            self.follower.start(target, identified.bbox)
+        except Exception as exc:
+            print(f"[FOLLOW] local tracker failed to start: {exc}")
+            self._speak("The local follower could not start.")
+            return
+        self._speak("I found the target. Following now.")
+
+    def _stop_follower(self, reason: str, *, preserve_stop: bool = False) -> None:
+        if self.follower is not None and self.follower.active:
+            self.motion_stop.set()
+            stop_motors("follower_stopped")
+            self.follower.stop(reason)
+            if not preserve_stop:
+                self.motion_stop.clear()
 
     def _run_target_mission(self, mission: TargetMission) -> None:
         target = mission.target
@@ -435,7 +498,9 @@ class RobotApp:
                     "  /calibrate-mic       recalibrate the quiet-noise threshold\n"
                     "  /test-camera         capture one frame without sending it\n"
                     "  /lidar               show live X2 connection and front distance\n"
-                    "  /sensors             show LiDAR plus disabled sensor status\n"
+                    "  /sensors             show LiDAR, ultrasonic, and MPU status\n"
+                    "  /follow TARGET       initialize continuous camera + LiDAR following\n"
+                    "  /unfollow            stop local follower mode\n"
                     "  /stop                immediately stop and brake all motors\n"
                     "  /quit                stop the app"
                 )
@@ -497,8 +562,15 @@ class RobotApp:
                 print(f"[SENSOR] {json.dumps({'lidar': self._lidar_status(), 'mcu': read_sensors()}, sort_keys=True)}")
             elif command == "/lidar":
                 print(f"[LIDAR] {json.dumps(self._lidar_status(), sort_keys=True)}")
+            elif command == "/follow":
+                if not argument:
+                    raise ValueError("usage: /follow TARGET")
+                self._start_follower(argument)
+            elif command == "/unfollow":
+                self._stop_follower("console command")
             elif command == "/stop":
                 self.motion_stop.set()
+                self._stop_follower("emergency stop", preserve_stop=True)
                 stop_motors("console_stop")
             elif command == "/quit":
                 self.running = False
@@ -523,6 +595,8 @@ class RobotApp:
                 "stop_distance_mm": 100,
                 "last_error": "LiDAR is unavailable outside UNO Q hardware mode",
             }
+        if self.navigator is not None:
+            return self.navigator.live_status(include_points=False)
         return self.lidar.scan_status(include_points=False)
 
     def _handle_action(self, call: MotionCall) -> ActionResult:
@@ -546,11 +620,12 @@ class RobotApp:
                 self.set_state(State.ACTING)
                 if self.lidar is not None:
                     self.lidar.clear_emergency_latch()
-                content = (
-                    execute_motion(call, self.motion_stop, self.lidar.guard_reason)
-                    if HARDWARE_MOTION and self.lidar is not None
-                    else execute_motion(call, self.motion_stop)
-                )
+                if HARDWARE_MOTION and self.navigator is not None:
+                    content = self.navigator.execute(call, self.motion_stop)
+                elif HARDWARE_MOTION and self.lidar is not None:
+                    content = execute_motion(call, self.motion_stop, self.lidar.guard_reason)
+                else:
+                    content = execute_motion(call, self.motion_stop)
         finally:
             self.set_state(State.PROCESSING)
             time.sleep(POST_MOTION_MIC_COOLDOWN_SECONDS)
@@ -579,6 +654,7 @@ class RobotApp:
 
     def _emergency_stop(self) -> None:
         self.motion_stop.set()
+        self._stop_follower("WebUI emergency stop", preserve_stop=True)
         stop_motors("web_emergency_stop")
         print("[STOP] emergency stop requested from live camera view")
 
@@ -602,6 +678,7 @@ class RobotApp:
     def close(self) -> None:
         self.running = False
         self.motion_stop.set()
+        self._stop_follower("application shutdown", preserve_stop=True)
         if HARDWARE_MOTION:
             stop_motors("python_shutdown")
         if self.live_view is not None:
@@ -684,8 +761,13 @@ def create_robot_app() -> RobotApp:
         if HARDWARE_MOTION
         else None
     )
+    navigator = (
+        NavigationController(lidar)
+        if HARDWARE_MOTION and lidar is not None and NavigationController is not None
+        else None
+    )
     live_view = (
-        LiveCameraView(agent.camera, lidar.scan_status)
+        LiveCameraView(agent.camera, navigator.live_status if navigator is not None else lidar.scan_status)
         if HARDWARE_MOTION and lidar is not None
         else None
     )
@@ -699,6 +781,7 @@ def create_robot_app() -> RobotApp:
         VoiceIO(settings.mic_device, settings.output_device, settings.playback_gain),
         live_view,
         lidar,
+        navigator,
     )
 
 

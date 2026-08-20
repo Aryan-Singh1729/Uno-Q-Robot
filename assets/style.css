@@ -17,6 +17,8 @@ canvas { width: 100%; height: auto; display: block; }
 #placeholder { position: absolute; color: #8fa9aa; }
 .lidar-readout { padding: 13px 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 12px; border-top: 1px solid #17363a; color: #a9c1c2; }
 .lidar-readout strong { color: #eefafa; }
+.sensor-readout { padding: 13px 16px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 14px; border-top: 1px solid #17363a; color: #a9c1c2; font: 12px monospace; }
+.sensor-readout strong { grid-column: 1 / -1; color: #52d7d8; }
 .status-card { margin-top: 14px; padding: 16px; border: 1px solid #21464b; border-radius: 14px; background: #0d2024; display: flex; align-items: center; gap: 12px; }
 .badge { border-radius: 99px; padding: 6px 10px; background: #0c7578; font: 700 12px monospace; text-transform: uppercase; }
 .badge.error { background: #a92e36; }

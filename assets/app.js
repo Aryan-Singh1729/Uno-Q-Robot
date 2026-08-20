@@ -10,6 +10,10 @@ const lidarState = document.getElementById('lidar-state');
 const lidarDetail = document.getElementById('lidar-detail');
 const frontDistance = document.getElementById('front-distance');
 const nearestDistance = document.getElementById('nearest-distance');
+const navEvent = document.getElementById('nav-event');
+const ultrasonic = document.getElementById('ultrasonic');
+const imu = document.getElementById('imu');
+const follower = document.getElementById('follower');
 let currentBitmap = null;
 
 function drawLidar(message) {
@@ -102,6 +106,9 @@ socket.on('robot_status', (message) => {
   state.textContent = message.state || 'unknown';
   state.className = message.state === 'camera_error' ? 'badge error' : 'badge';
   detail.textContent = message.detail || '';
+  if ((message.state || '').startsWith('follow')) {
+    follower.textContent = `Follower: ${message.state}${message.detail ? ` - ${message.detail}` : ''}`;
+  }
 });
 
 socket.on('lidar_scan', (message) => {
@@ -119,6 +126,18 @@ socket.on('lidar_scan', (message) => {
     : 'Nearest: --';
   lidarDetail.textContent = message.last_error ||
     `${Array.isArray(message.points) ? message.points.length : 0} plotted points; stop at 10.0 cm`;
+  const event = message.navigation_event || {};
+  navEvent.textContent = `Navigation: ${event.code || 'monitoring'}${event.detail ? ` — ${event.detail}` : ''}`;
+  const supplemental = message.supplemental || {};
+  const sensorText = (ready, value, label) => ready && Number(value) > 0
+    ? `${label}: ${(Number(value) / 10).toFixed(1)} cm`
+    : `${label}: unavailable`;
+  ultrasonic.textContent = sensorText(supplemental.ultrasonic_ready, supplemental.ultrasonic_mm, 'Front ultrasonic');
+  const roll = Number(supplemental.roll_deg);
+  const pitch = Number(supplemental.pitch_deg);
+  imu.textContent = supplemental.mpu6050_ready && Number.isFinite(roll) && Number.isFinite(pitch)
+    ? `Tilt: roll ${roll.toFixed(1)}°, pitch ${pitch.toFixed(1)}°`
+    : 'Tilt: unavailable';
 });
 
 document.getElementById('stop').addEventListener('click', () => {

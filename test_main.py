@@ -23,15 +23,14 @@ class AppPackagingTests(unittest.TestCase):
             "static const int FRONT_RIGHT_POLARITY = 1;",
             "static const int REAR_LEFT_POLARITY = -1;",
             "static const int REAR_RIGHT_POLARITY = 1;",
-            "setMotor(D1_BIN1, D1_BIN2, D1_PWMB, direction * REAR_LEFT_POLARITY, pwm);",
-            "setMotor(D2_AIN1, D2_AIN2, D2_PWMA, direction * FRONT_RIGHT_POLARITY, pwm);",
-            "setMotor(D2_BIN1, D2_BIN2, D2_PWMB, direction * REAR_RIGHT_POLARITY, pwm);",
-            "setMotor(D1_BIN1, D1_BIN2, D1_PWMB, left * REAR_LEFT_POLARITY, pwm);",
+            "setMotor(D1_BIN1, D1_BIN2, D1_PWMB, direction * REAR_RIGHT_POLARITY, rightPwm);",
+            "setMotor(D2_AIN1, D2_AIN2, D2_PWMA, direction * FRONT_RIGHT_POLARITY, rightPwm);",
+            "setMotor(D2_BIN1, D2_BIN2, D2_PWMB, direction * REAR_LEFT_POLARITY, leftPwm);",
+            "setMotor(D1_BIN1, D1_BIN2, D1_PWMB, right * REAR_RIGHT_POLARITY, pwm);",
             "setMotor(D2_AIN1, D2_AIN2, D2_PWMA, right * FRONT_RIGHT_POLARITY, pwm);",
-            "setMotor(D2_BIN1, D2_BIN2, D2_PWMB, right * REAR_RIGHT_POLARITY, pwm);",
-            "const int correctedDirection = -direction;",
-            '\\"firmware_version\\":\\"lidar-guard-v16.0\\"',
-            '\\"motor_map\\":\\"D1A=front_left,D1B=rear_left,D2A=front_right,D2B=rear_right\\"',
+            "setMotor(D2_BIN1, D2_BIN2, D2_PWMB, left * REAR_LEFT_POLARITY, pwm);",
+            '\\"firmware_version\\":\\"navigation-v18.0\\"',
+            '\\"motor_map\\":\\"D1A=front_left,D1B=rear_right,D2A=front_right,D2B=rear_left\\"',
             '\\"lidar_guard_source\\":\\"linux_usb\\"',
         )
         for line in expected_lines:
@@ -39,16 +38,35 @@ class AppPackagingTests(unittest.TestCase):
                 self.assertIn(line, sketch)
         self.assertNotIn("Serial1.begin", sketch)
 
+    def test_final_sensor_pin_map_and_hard_safety_are_present(self):
+        sketch = Path("sketch/sketch.ino").read_text(encoding="utf-8")
+        required = (
+            "static const uint8_t ULTRASONIC_TRIG_PIN = A3;",
+            "static const uint8_t ULTRASONIC_ECHO_PIN = A4;",
+            "static const uint8_t MPU_SDA_PIN = SDA;",
+            "static const uint8_t MPU_SCL_PIN = SCL;",
+            "const bool blocked = centerClose;",
+            "publishNavigationEvent(\"TILT_WARNING\"",
+            "publishNavigationEvent(\"OBSTACLE_DETECTED\"",
+            "finishMotion(\"obstacle\"",
+        )
+        for line in required:
+            with self.subTest(line=line):
+                self.assertIn(line, sketch)
+
+        libraries = Path("sketch/sketch.yaml").read_text(encoding="utf-8")
+        for name in ("Adafruit MPU6050", "Adafruit BusIO"):
+            self.assertIn(name, libraries)
+        self.assertNotIn("VL53", libraries)
+
     def test_motor_map_produces_required_four_command_truth_table(self):
-        # Physical forward is +1 and physical backward is -1. The final floor
-        # test established that this chassis needs the inverse tank-turn sign.
-        # These assertions preserve straight motion and protect that one
-        # semantic correction without changing channel ownership or polarity.
+        # Physical forward is +1 and physical backward is -1. These assertions
+        # lock the user's final physical channel ownership.
         channels = {
             "front_left": ("D1A", -1),
-            "rear_left": ("D1B", -1),
+            "rear_right": ("D1B", 1),
             "front_right": ("D2A", 1),
-            "rear_right": ("D2B", 1),
+            "rear_left": ("D2B", -1),
         }
         commands = {
             "forward": {
@@ -64,16 +82,16 @@ class AppPackagingTests(unittest.TestCase):
                 "rear_right": -1,
             },
             "left": {
-                "front_left": 1,
-                "rear_left": 1,
-                "front_right": -1,
-                "rear_right": -1,
-            },
-            "right": {
                 "front_left": -1,
                 "rear_left": -1,
                 "front_right": 1,
                 "rear_right": 1,
+            },
+            "right": {
+                "front_left": 1,
+                "rear_left": 1,
+                "front_right": -1,
+                "rear_right": -1,
             },
         }
 
@@ -85,16 +103,16 @@ class AppPackagingTests(unittest.TestCase):
             for command, wheel_directions in commands.items()
         }
         self.assertEqual(
-            electrical["forward"], {"D1A": -1, "D1B": -1, "D2A": 1, "D2B": 1}
+            electrical["forward"], {"D1A": -1, "D1B": 1, "D2A": 1, "D2B": -1}
         )
         self.assertEqual(
-            electrical["backward"], {"D1A": 1, "D1B": 1, "D2A": -1, "D2B": -1}
+            electrical["backward"], {"D1A": 1, "D1B": -1, "D2A": -1, "D2B": 1}
         )
         self.assertEqual(
-            electrical["left"], {"D1A": -1, "D1B": -1, "D2A": -1, "D2B": -1}
+            electrical["left"], {"D1A": 1, "D1B": 1, "D2A": 1, "D2B": 1}
         )
         self.assertEqual(
-            electrical["right"], {"D1A": 1, "D1B": 1, "D2A": 1, "D2B": 1}
+            electrical["right"], {"D1A": -1, "D1B": -1, "D2A": -1, "D2B": -1}
         )
 
 

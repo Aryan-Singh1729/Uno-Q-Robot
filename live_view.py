@@ -9,7 +9,7 @@ from typing import Any
 
 
 class LiveCameraView:
-    """Publish camera frames, MCU LiDAR scans, and task state through WebUI."""
+    """Publish camera, fused navigation telemetry, and task state through WebUI."""
 
     def __init__(
         self,

@@ -1,4 +1,4 @@
-"""Minimal YDLIDAR X2 serial reader and forward-sector safety guard."""
+"""YDLIDAR X2 reader, exact emergency guard, and local navigation sectors."""
 
 from __future__ import annotations
 
@@ -218,6 +218,66 @@ class YDLidarX2:
                 for angle, (distance, timestamp) in self.points.items()
                 if now - timestamp <= 1.0 and 0 < distance <= 8_000
             )
+
+    @staticmethod
+    def _angle_delta(angle: float, center: float) -> float:
+        return (angle - center + 180.0) % 360.0 - 180.0
+
+    def sector_readings(self, center_deg: float, half_width_deg: float) -> list[float]:
+        """Return fresh valid ranges in one robot-relative angular sector."""
+        return sorted(
+            distance
+            for angle, distance in self._fresh_points()
+            if abs(self._angle_delta(angle, center_deg)) <= half_width_deg
+        )
+
+    def sector_clearance(self, center_deg: float, half_width_deg: float) -> float | None:
+        """Use a low percentile so one noisy sample does not steer the robot."""
+        readings = self.sector_readings(center_deg, half_width_deg)
+        if not readings:
+            return None
+        return readings[min(len(readings) - 1, max(0, len(readings) // 5))]
+
+    def navigation_snapshot(self) -> dict[str, Any]:
+        """Summarize free space for deterministic navigation, never for the LLM."""
+        status = self.status()
+        sectors = {
+            "front": self.sector_clearance(0, 28),
+            "front_left": self.sector_clearance(325, 35),
+            "left": self.sector_clearance(270, 38),
+            "front_right": self.sector_clearance(35, 35),
+            "right": self.sector_clearance(90, 38),
+            "rear": self.sector_clearance(180, 35),
+        }
+        return {
+            **status,
+            "sectors_mm": {
+                name: round(value) if value is not None else None
+                for name, value in sectors.items()
+            },
+        }
+
+    def motion_guard_reason(self, motion: str, amount: float) -> str | None:
+        """Guard the swept direction while permitting a stopped robot to escape."""
+        status = self.status()
+        if not status["connected"] or not status["scan_fresh"]:
+            return "YDLIDAR X2 scan unavailable" if self.required else None
+        if motion == "move":
+            center = 0 if amount > 0 else 180
+            half_width = 55
+        elif motion in {"turn", "spin"}:
+            center = 300 if amount > 0 else 60
+            half_width = 75
+        else:
+            center = 0
+            half_width = 180
+        readings = self.sector_readings(center, half_width)
+        distance = min(readings, default=0.0)
+        if 0 < distance <= self.stop_distance_mm:
+            self.emergency_latched = True
+            self.emergency_distance_mm = round(distance)
+            return f"YDLIDAR X2 emergency stop at {distance / 10:.1f} cm"
+        return None
 
     def status(self) -> dict[str, Any]:
         readings = self._front_readings()

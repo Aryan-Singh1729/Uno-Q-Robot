@@ -1,5 +1,5 @@
-name: WALL-E LiDAR Guard Robot v16.0
-description: Timed UNO Q motion with a USB YDLIDAR X2 10 cm emergency stop and live camera-plus-LiDAR view
+name: WALL-E Final Navigation v18.0
+description: LiDAR-primary UNO Q navigation with camera follower, front ultrasonic backup, MPU6050, voice, and live telemetry
 bricks:
   - arduino:web_ui
 icon: 🤖

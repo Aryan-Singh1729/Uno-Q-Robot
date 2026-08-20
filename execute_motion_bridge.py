@@ -15,7 +15,7 @@ POLL_INTERVAL_SECONDS = 0.05
 BRIDGE_READY_TIMEOUT_SECONDS = 20.0
 MOTION_TIMEOUT_GRACE_SECONDS = 2.0
 TERMINAL_STATES = {"completed", "cancelled", "obstacle", "error", "idle"}
-FIRMWARE_VERSION = "lidar-guard-v16.0"
+FIRMWARE_VERSION = "navigation-v18.0"
 BRIDGE_LOCK = threading.Lock()
 
 
@@ -30,11 +30,7 @@ def _sensor_summary(status: dict[str, Any]) -> str:
         reading = status.get(key)
         return f"{reading}{unit}" if reading is not None else "unknown"
 
-    return (
-        f"ultrasonic={value('ultrasonic_cm', 'cm')}, "
-        f"left_tof={value('tof_left_mm', 'mm')}, "
-        f"right_tof={value('tof_right_mm', 'mm')}"
-    )
+    return f"front_ultrasonic={value('ultrasonic_mm', 'mm')}"
 
 
 def _decode_response(raw: Any, operation: str) -> dict[str, Any]:
@@ -68,7 +64,7 @@ def wait_for_mcu(timeout: float = BRIDGE_READY_TIMEOUT_SECONDS) -> dict[str, Any
                     continue
                 print("[MOTOR] UNO Q MCU bridge is ready")
                 print(
-                    "[LIDAR] Linux USB emergency guard configured at "
+                    "[NAV] LiDAR primary navigation and front emergency backup configured at "
                     f"{status.get('lidar_stop_distance_mm', 100) / 10:.1f} cm"
                 )
                 return status

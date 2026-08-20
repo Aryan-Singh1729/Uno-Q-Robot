@@ -18,10 +18,23 @@ from robot_agent import (
     execute_motion,
     parse_api_keys,
     parse_direct_motion,
+    parse_follow_command,
     parse_target_mission,
     validate_inspection,
     validate_motion,
 )
+
+
+class FollowCommandTests(unittest.TestCase):
+    def test_follow_me_uses_center_person_identity(self):
+        self.assertEqual(
+            parse_follow_command("Please follow me"),
+            ("start", "person nearest the center of the camera"),
+        )
+
+    def test_named_animal_and_stop_are_local_modes(self):
+        self.assertEqual(parse_follow_command("follow this dog"), ("start", "dog"))
+        self.assertEqual(parse_follow_command("stop following"), ("stop", ""))
 
 
 def tool_call(call_id, name, arguments):

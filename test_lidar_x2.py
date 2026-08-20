@@ -61,6 +61,35 @@ class YDLidarX2Tests(unittest.TestCase):
         lidar = YDLidarX2(required=True)
         self.assertEqual(lidar.guard_reason(), "YDLIDAR X2 scan unavailable")
 
+    def test_navigation_snapshot_separates_left_front_and_right(self):
+        lidar = YDLidarX2(required=True)
+        lidar.serial = object()
+        lidar.running = True
+        now = time.monotonic()
+        lidar.last_packet_at = now
+        lidar.points = {
+            0: (500, now),
+            5: (520, now),
+            90: (1400, now),
+            270: (300, now),
+            180: (1700, now),
+        }
+        sectors = lidar.navigation_snapshot()["sectors_mm"]
+        self.assertEqual(sectors["front"], 500)
+        self.assertEqual(sectors["left"], 300)
+        self.assertEqual(sectors["right"], 1400)
+        self.assertEqual(sectors["rear"], 1700)
+
+    def test_escape_guard_checks_commanded_direction(self):
+        lidar = YDLidarX2(required=True)
+        lidar.serial = object()
+        lidar.running = True
+        now = time.monotonic()
+        lidar.last_packet_at = now
+        lidar.points = {0: (90, now), 180: (900, now)}
+        self.assertIsNotNone(lidar.motion_guard_reason("move", 1.0))
+        self.assertIsNone(lidar.motion_guard_reason("move", -1.0))
+
 
 if __name__ == "__main__":
     unittest.main()

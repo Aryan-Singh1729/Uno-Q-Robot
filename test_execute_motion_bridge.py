@@ -124,7 +124,7 @@ class BridgeMotionTests(unittest.TestCase):
                             "ready": True,
                             "status": "idle",
                             "motion_id": 0,
-                            "firmware_version": "lidar-guard-v16.0",
+                            "firmware_version": "navigation-v18.0",
                             "motor_test_mode": False,
                             "sensor_guard_enabled": True,
                             "lidar_stop_distance_mm": 100,
